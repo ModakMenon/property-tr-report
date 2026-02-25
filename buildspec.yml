@@ -1,0 +1,24 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com
+
+  build:
+    commands:
+      - echo Building Backend image...
+      - docker build -t legal-audit-backend ./backend
+      - docker tag legal-audit-backend:latest $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-backend:latest
+
+      - echo Building Worker image...
+      - docker build -t legal-audit-worker -f ./backend/Dockerfile.worker ./backend
+      - docker tag legal-audit-worker:latest $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-worker:latest
+
+  post_build:
+    commands:
+      - echo Pushing images to ECR...
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-backend:latest
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-worker:latest
+      - echo Done!
