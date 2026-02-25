@@ -1,0 +1,59 @@
+# Render.com Blueprint Configuration
+# Deploy with: render blueprint sync
+
+services:
+  # Backend API Service
+  - type: web
+    name: legal-audit-api
+    runtime: node
+    region: singapore  # Closest to India
+    plan: starter
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: S3_BUCKET_NAME
+        sync: false
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPER_ADMIN_EMAIL
+        sync: false
+      - key: FRONTEND_URL
+        fromService:
+          name: legal-audit-frontend
+          type: web
+          property: host
+
+  # Frontend Static Site
+  - type: web
+    name: legal-audit-frontend
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          name: legal-audit-api
+          type: web
+          property: host
