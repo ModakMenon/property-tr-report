@@ -10,7 +10,7 @@
     "worker": "node src/workers/documentWorker.js"
   },
   "dependencies": {
-    "@anthropic-ai/bedrock-sdk": "^0.26.4",
+    "@aws-sdk/client-bedrock-runtime": "^3.997.0",
     "@aws-sdk/client-s3": "^3.525.0",
     "@aws-sdk/client-secrets-manager": "^3.525.0",
     "@aws-sdk/lib-storage": "^3.525.0",
@@ -27,6 +27,9 @@
     "pdf-parse": "^1.1.1",
     "unzipper": "^0.12.3",
     "uuid": "^9.0.0"
+  },
+  "overrides": {
+    "@anthropic-ai/sdk": "0.39.0"
   },
   "engines": {
     "node": ">=18.0.0"
