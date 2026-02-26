@@ -741,3 +741,13 @@ async function processReportGeneration(jobId, job) {
 }
 
 export { worker };
+// Start the worker process
+console.log('[Worker] Starting worker process...');
+initializeWorker()
+  .then(() => {
+    console.log('[Worker] Worker started successfully - waiting for jobs');
+  })
+  .catch((err) => {
+    console.error('[Worker] Failed to start:', err);
+    process.exit(1);
+  });
