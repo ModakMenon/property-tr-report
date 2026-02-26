@@ -751,3 +751,17 @@ initializeWorker()
     console.error('[Worker] Failed to start:', err);
     process.exit(1);
   });
+
+  // Keep process alive
+process.on('SIGTERM', () => {
+  console.log('[Worker] Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('[Worker] Received SIGINT, shutting down gracefully...');
+  process.exit(0);
+});
+
+// Prevent process from exiting
+setInterval(() => {}, 1000 * 60 * 60);
