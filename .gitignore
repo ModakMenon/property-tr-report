@@ -6,4 +6,4 @@ backend/.env
 frontend/.env
 dist/
 frontend/dist/
-*.log"
+*.log"cd
