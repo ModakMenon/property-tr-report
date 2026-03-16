@@ -9,11 +9,11 @@ phases:
   build:
     commands:
       - echo Building Backend image...
-      - docker build -t legal-audit-backend ./backend
+      - docker build --no-cache -t legal-audit-backend ./backend
       - docker tag legal-audit-backend:latest $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-backend:latest
 
       - echo Building Worker image...
-      - docker build -t legal-audit-worker -f ./backend/Dockerfile.worker ./backend
+      - docker build --no-cache -t legal-audit-worker -f ./backend/Dockerfile.worker ./backend
       - docker tag legal-audit-worker:latest $AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/legal-audit-worker:latest
 
   post_build:
