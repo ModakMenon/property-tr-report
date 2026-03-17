@@ -4,7 +4,6 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const s3Client = new S3Client({
   region: process.env.AWS_REGION || 'ap-south-1',
-  // No credentials here - uses IAM role on ECS, AWS CLI locally
 });
 
 const BUCKET = process.env.S3_BUCKET_NAME || 'legal-audit-platform';
@@ -78,7 +77,6 @@ const DEFAULT_PROMPT = {
 
 export async function initializeS3Bucket() {
   try {
-    // Check if masters/legal_audit_prompt.json exists
     try {
       await s3Client.send(new HeadObjectCommand({
         Bucket: BUCKET,
@@ -87,7 +85,6 @@ export async function initializeS3Bucket() {
       console.log('  Masters prompt already exists');
     } catch (err) {
       if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
-        // Create default prompt
         await s3Client.send(new PutObjectCommand({
           Bucket: BUCKET,
           Key: 'masters/legal_audit_prompt.json',
@@ -100,7 +97,6 @@ export async function initializeS3Bucket() {
       }
     }
 
-    // Check if users.json exists
     try {
       await s3Client.send(new HeadObjectCommand({
         Bucket: BUCKET,
@@ -143,25 +139,11 @@ export async function uploadToS3(key, body, contentType = 'application/octet-str
       ContentType: contentType
     }
   });
-
-  upload.on('httpUploadProgress', (progress) => {
-    // Progress callback can be used for tracking
-  });
-
   return upload.done();
 }
 
-// Streaming upload for large files (up to 4GB+) with detailed logging
 export async function uploadStreamToS3(key, stream, contentType = 'application/octet-stream') {
-  console.log(`[S3] ========================================`);
-  console.log(`[S3] Starting multipart upload`);
-  console.log(`[S3] Bucket: ${BUCKET}`);
-  console.log(`[S3] Key: ${key}`);
-  
-  const partSize = 10 * 1024 * 1024; // 10MB per part
-  console.log(`[S3] Part size: ${partSize / 1024 / 1024} MB`);
-  console.log(`[S3] Parallel uploads: 4`);
-  console.log(`[S3] ========================================`);
+  console.log(`[S3] Starting multipart upload: ${key}`);
   
   const upload = new Upload({
     client: s3Client,
@@ -171,9 +153,8 @@ export async function uploadStreamToS3(key, stream, contentType = 'application/o
       Body: stream,
       ContentType: contentType
     },
-    // Configure multipart upload for large files
-    queueSize: 4, // Number of parallel uploads
-    partSize: partSize,
+    queueSize: 4,
+    partSize: 10 * 1024 * 1024,
     leavePartsOnError: false
   });
 
@@ -182,39 +163,20 @@ export async function uploadStreamToS3(key, stream, contentType = 'application/o
 
   upload.on('httpUploadProgress', (progress) => {
     const loadedMB = Math.floor(progress.loaded / 1024 / 1024);
-    const currentPart = Math.ceil(progress.loaded / partSize);
-    
-    // Log every new part
+    const currentPart = Math.ceil(progress.loaded / (10 * 1024 * 1024));
     if (currentPart > partCount) {
       partCount = currentPart;
-      console.log(`[S3] ✓ Part ${partCount} uploaded (${loadedMB} MB total)`);
+      console.log(`[S3] Part ${partCount} uploaded (${loadedMB} MB total)`);
     }
-    
-    // Also log every 50MB
     if (loadedMB >= lastLoggedMB + 50) {
-      if (progress.total) {
-        const percent = Math.round((progress.loaded / progress.total) * 100);
-        console.log(`[S3] Progress: ${loadedMB} MB / ${Math.round(progress.total / 1024 / 1024)} MB (${percent}%)`);
-      } else {
-        console.log(`[S3] Progress: ${loadedMB} MB uploaded`);
-      }
+      console.log(`[S3] Progress: ${loadedMB} MB uploaded`);
       lastLoggedMB = loadedMB;
     }
   });
 
-  try {
-    const result = await upload.done();
-    console.log(`[S3] ========================================`);
-    console.log(`[S3] ✓ Upload complete!`);
-    console.log(`[S3] Total parts uploaded: ${partCount}`);
-    console.log(`[S3] Location: ${result.Location}`);
-    console.log(`[S3] ========================================`);
-    return result;
-  } catch (error) {
-    console.error(`[S3] ✗ Upload failed:`, error.message);
-    console.error(`[S3] Parts completed before failure: ${partCount}`);
-    throw error;
-  }
+  const result = await upload.done();
+  console.log(`[S3] Upload complete: ${key}`);
+  return result;
 }
 
 export async function getFromS3(key) {
@@ -251,35 +213,33 @@ export async function listS3Objects(prefix, maxKeys = 10000) {
     const params = {
       Bucket: BUCKET,
       Prefix: prefix,
-      MaxKeys: 1000 // S3 max per request
+      MaxKeys: 1000
     };
-    
     if (continuationToken) {
       params.ContinuationToken = continuationToken;
     }
-    
     const response = await s3Client.send(new ListObjectsV2Command(params));
-    
     if (response.Contents) {
       allObjects.push(...response.Contents);
     }
-    
     continuationToken = response.IsTruncated ? response.NextContinuationToken : null;
-    
-    // Safety limit
-    if (allObjects.length >= maxKeys) {
-      console.warn(`[S3] Reached max keys limit (${maxKeys}), stopping pagination`);
-      break;
-    }
+    if (allObjects.length >= maxKeys) break;
   } while (continuationToken);
   
   return allObjects;
 }
 
 export async function getSignedDownloadUrl(key, expiresIn = 3600) {
-  const command = new GetObjectCommand({
+  const command = new GetObjectCommand({ Bucket: BUCKET, Key: key });
+  return getSignedUrl(s3Client, command, { expiresIn });
+}
+
+// NEW: Generate presigned URL for direct browser-to-S3 upload (bypasses CloudFront/ALB)
+export async function getSignedUploadUrl(key, contentType = 'application/zip', expiresIn = 3600) {
+  const command = new PutObjectCommand({
     Bucket: BUCKET,
-    Key: key
+    Key: key,
+    ContentType: contentType
   });
   return getSignedUrl(s3Client, command, { expiresIn });
 }

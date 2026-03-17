@@ -57,36 +57,52 @@ export const jobsApi = {
     method: 'POST',
     body: JSON.stringify({ userEmail })
   }),
-  
+
+  // Upload ZIP directly to S3 via presigned URL (bypasses CloudFront/ALB - no size limit)
   uploadZip: async (jobId, file, onProgress) => {
-    const formData = new FormData();
-    formData.append('file', file);
-    
-    return new Promise((resolve, reject) => {
+    // Step 1 - Get presigned URL from backend
+    const { uploadUrl, s3Key } = await fetchApi(`/api/jobs/${jobId}/presign-upload`, {
+      method: 'POST',
+      body: JSON.stringify({
+        fileName: file.name,
+        contentType: file.type || 'application/zip'
+      })
+    });
+
+    // Step 2 - Upload directly to S3 (no CloudFront, no size limit)
+    await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      
+
       xhr.upload.addEventListener('progress', (event) => {
         if (event.lengthComputable && onProgress) {
           onProgress(Math.round((event.loaded / event.total) * 100));
         }
       });
-      
+
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(JSON.parse(xhr.responseText));
+          resolve();
         } else {
-          reject(new Error('Upload failed'));
+          reject(new Error(`S3 upload failed with status ${xhr.status}`));
         }
       });
-      
+
       xhr.addEventListener('error', () => reject(new Error('Upload failed')));
-      
-      xhr.open('POST', `${API_URL}/api/jobs/${jobId}/upload`);
-      const token = localStorage.getItem('token');
-      if (token) {
-        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-      }
-      xhr.send(formData);
+
+      // PUT directly to S3 presigned URL
+      xhr.open('PUT', uploadUrl);
+      xhr.setRequestHeader('Content-Type', file.type || 'application/zip');
+      xhr.send(file);
+    });
+
+    // Step 3 - Notify backend that upload is complete
+    return fetchApi(`/api/jobs/${jobId}/confirm-upload`, {
+      method: 'POST',
+      body: JSON.stringify({
+        s3Key,
+        fileName: file.name,
+        fileSize: file.size
+      })
     });
   },
   
@@ -128,13 +144,11 @@ export const jobsApi = {
     });
   },
   
-  // Get PDF analysis for a job
   analyzePdf: (jobId) => fetchApi(`/api/jobs/${jobId}/analyze-pdf`),
   
   uploadDocuments: async (jobId, files) => {
     const formData = new FormData();
     files.forEach(file => formData.append('files', file));
-    
     return fetchApi(`/api/jobs/${jobId}/upload-documents`, {
       method: 'POST',
       body: formData
@@ -176,12 +190,10 @@ export const jobsApi = {
       handlers.onProcessing?.(JSON.parse(e.data));
     });
     
-    // Chunk progress for large PDF processing
     eventSource.addEventListener('chunk-progress', (e) => {
       handlers.onChunkProgress?.(JSON.parse(e.data));
     });
     
-    // Token usage tracking
     eventSource.addEventListener('tokens', (e) => {
       handlers.onTokens?.(JSON.parse(e.data));
     });

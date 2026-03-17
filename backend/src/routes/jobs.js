@@ -1,7 +1,7 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import Busboy from 'busboy';
-import { uploadStreamToS3, uploadToS3, getJsonFromS3, putJsonToS3, listS3Objects, getSignedDownloadUrl, getFromS3, streamToBuffer } from '../services/s3Service.js';
+import { uploadStreamToS3, uploadToS3, getJsonFromS3, putJsonToS3, listS3Objects, getSignedDownloadUrl, getFromS3, streamToBuffer, getSignedUploadUrl } from '../services/s3Service.js';
 import { queueManager, addSSEClient, removeSSEClient, getJobStatus, setJobStatus, updateJobStatus } from '../services/queueService.js';
 import { getDocumentAnalysis } from '../services/claudeService.js';
 import { analyzePdf } from '../services/pdfChunkService.js';
@@ -23,24 +23,57 @@ router.post('/create', async (req, res) => {
       failedCount: 0
     };
 
-    // Save job metadata to S3
     await putJsonToS3(`jobs/${jobId}/metadata.json`, jobData);
-    
-    // Set initial status in memory
     setJobStatus(jobId, jobData);
 
-    res.json({
-      success: true,
-      jobId,
-      job: jobData
-    });
+    res.json({ success: true, jobId, job: jobData });
   } catch (error) {
     console.error('Error creating job:', error);
     res.status(500).json({ error: 'Failed to create job' });
   }
 });
 
-// Upload documents (ZIP file) - Direct stream to S3
+// Step 1: Generate presigned URL for direct browser → S3 upload (bypasses CloudFront/ALB)
+router.post('/:jobId/presign-upload', async (req, res) => {
+  const { jobId } = req.params;
+  const { fileName, contentType } = req.body;
+
+  try {
+    const s3Key = `jobs/${jobId}/uploads/raw/documents.zip`;
+    const uploadUrl = await getSignedUploadUrl(s3Key, contentType || 'application/zip', 3600);
+
+    console.log(`[Presign] Generated upload URL for job: ${jobId}`);
+
+    res.json({ success: true, uploadUrl, s3Key });
+  } catch (error) {
+    console.error('[Presign] Error generating presigned URL:', error);
+    res.status(500).json({ error: 'Failed to generate upload URL' });
+  }
+});
+
+// Step 2: Confirm upload complete and update job status
+router.post('/:jobId/confirm-upload', async (req, res) => {
+  const { jobId } = req.params;
+  const { s3Key, fileName, fileSize } = req.body;
+
+  try {
+    updateJobStatus(jobId, {
+      status: 'uploaded',
+      uploadedAt: new Date().toISOString(),
+      fileName: fileName,
+      fileSize: fileSize
+    });
+
+    console.log(`[Confirm] Upload confirmed for job: ${jobId}, file: ${fileName}, size: ${(fileSize / 1024 / 1024).toFixed(2)}MB`);
+
+    res.json({ success: true, message: 'File uploaded successfully', fileSize, fileName });
+  } catch (error) {
+    console.error('[Confirm] Error confirming upload:', error);
+    res.status(500).json({ error: 'Failed to confirm upload' });
+  }
+});
+
+// Upload documents (ZIP file) - Direct stream to S3 (kept as fallback)
 router.post('/:jobId/upload', async (req, res) => {
   const { jobId } = req.params;
   
@@ -50,9 +83,7 @@ router.post('/:jobId/upload', async (req, res) => {
   try {
     const busboy = Busboy({ 
       headers: req.headers,
-      limits: {
-        fileSize: 4 * 1024 * 1024 * 1024 // 4GB
-      }
+      limits: { fileSize: 4 * 1024 * 1024 * 1024 } // 4GB
     });
     
     let uploadPromise = null;
@@ -62,25 +93,20 @@ router.post('/:jobId/upload', async (req, res) => {
     busboy.on('file', (fieldname, fileStream, info) => {
       fileName = info.filename;
       console.log(`[Upload] Receiving file: ${fileName}`);
-      console.log(`[Upload] MIME type: ${info.mimeType}`);
       
       const s3Key = `jobs/${jobId}/uploads/raw/documents.zip`;
       
-      // Track bytes received
       fileStream.on('data', (chunk) => {
         fileSize += chunk.length;
-        if (fileSize % (10 * 1024 * 1024) === 0 || fileSize < 1024 * 1024) { // Log every 10MB
+        if (fileSize % (10 * 1024 * 1024) === 0) {
           console.log(`[Upload] Received: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
         }
       });
 
-      // Start streaming to S3
       uploadPromise = uploadStreamToS3(s3Key, fileStream, 'application/zip');
     });
 
     busboy.on('finish', async () => {
-      console.log(`[Upload] Busboy finished. Total received: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
-      
       if (!uploadPromise) {
         return res.status(400).json({ error: 'No file received' });
       }
@@ -92,16 +118,11 @@ router.post('/:jobId/upload', async (req, res) => {
         updateJobStatus(jobId, {
           status: 'uploaded',
           uploadedAt: new Date().toISOString(),
-          fileName: fileName,
-          fileSize: fileSize
+          fileName,
+          fileSize
         });
 
-        res.json({
-          success: true,
-          message: 'File uploaded successfully',
-          fileSize: fileSize,
-          fileName: fileName
-        });
+        res.json({ success: true, message: 'File uploaded successfully', fileSize, fileName });
       } catch (s3Error) {
         console.error(`[Upload] S3 upload failed:`, s3Error);
         res.status(500).json({ error: 'S3 upload failed: ' + s3Error.message });
@@ -113,7 +134,6 @@ router.post('/:jobId/upload', async (req, res) => {
       res.status(500).json({ error: 'Upload parsing failed: ' + err.message });
     });
 
-    // Pipe request to busboy
     req.pipe(busboy);
     
   } catch (error) {
@@ -127,17 +147,13 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
   const { jobId } = req.params;
   
   console.log(`[Upload-PDF] Starting single PDF upload for job: ${jobId}`);
-  console.log(`[Upload-PDF] Content-Length: ${req.headers['content-length']} bytes`);
   
   try {
     const busboy = Busboy({ 
       headers: req.headers,
-      limits: {
-        fileSize: 500 * 1024 * 1024 // 500MB max for single PDF
-      }
+      limits: { fileSize: 500 * 1024 * 1024 } // 500MB max for single PDF
     });
     
-    let uploadPromise = null;
     let fileName = '';
     let fileSize = 0;
     let fileBuffer = [];
@@ -145,9 +161,7 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
     busboy.on('file', (fieldname, fileStream, info) => {
       fileName = info.filename;
       console.log(`[Upload-PDF] Receiving file: ${fileName}`);
-      console.log(`[Upload-PDF] MIME type: ${info.mimeType}`);
       
-      // Collect chunks for analysis
       fileStream.on('data', (chunk) => {
         fileBuffer.push(chunk);
         fileSize += chunk.length;
@@ -158,8 +172,6 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
     });
 
     busboy.on('finish', async () => {
-      console.log(`[Upload-PDF] Busboy finished. Total received: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
-      
       if (fileBuffer.length === 0) {
         return res.status(400).json({ error: 'No file received' });
       }
@@ -167,17 +179,14 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
       try {
         const buffer = Buffer.concat(fileBuffer);
         
-        // Analyze PDF to determine processing strategy
         console.log(`[Upload-PDF] Analyzing PDF...`);
         const analysis = await analyzePdf(buffer);
         console.log(`[Upload-PDF] Analysis:`, JSON.stringify(analysis, null, 2));
         
-        // Upload to S3
         const s3Key = `jobs/${jobId}/uploads/extracted/${fileName}`;
         await uploadToS3(s3Key, buffer, 'application/pdf');
         console.log(`[Upload-PDF] S3 upload complete: ${s3Key}`);
 
-        // Create queue directly (single file, skip ZIP extraction)
         const queueData = {
           totalDocuments: 1,
           processedCount: 0,
@@ -187,7 +196,7 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
             type: '.pdf',
             size: fileSize,
             status: 'pending',
-            analysis: analysis // Include PDF analysis for reference
+            analysis
           }],
           results: [],
           failedDocuments: [],
@@ -199,8 +208,8 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
         updateJobStatus(jobId, {
           status: 'extracted',
           uploadedAt: new Date().toISOString(),
-          fileName: fileName,
-          fileSize: fileSize,
+          fileName,
+          fileSize,
           totalDocuments: 1,
           processedCount: 0,
           pdfAnalysis: analysis
@@ -209,10 +218,10 @@ router.post('/:jobId/upload-pdf', async (req, res) => {
         res.json({
           success: true,
           message: 'PDF uploaded successfully',
-          fileSize: fileSize,
+          fileSize,
           fileSizeMB: (fileSize / 1024 / 1024).toFixed(2),
-          fileName: fileName,
-          analysis: analysis
+          fileName,
+          analysis
         });
       } catch (error) {
         console.error(`[Upload-PDF] Processing failed:`, error);
@@ -238,7 +247,6 @@ router.get('/:jobId/analyze-pdf', async (req, res) => {
   const { jobId } = req.params;
   
   try {
-    // Get queue data to find the PDF
     const queueData = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
     
     if (!queueData.documents || queueData.documents.length === 0) {
@@ -250,25 +258,15 @@ router.get('/:jobId/analyze-pdf', async (req, res) => {
       return res.status(404).json({ error: 'No PDF document found in job' });
     }
 
-    // If analysis already exists, return it
     if (pdfDoc.analysis) {
-      return res.json({
-        success: true,
-        documentName: pdfDoc.name,
-        ...pdfDoc.analysis
-      });
+      return res.json({ success: true, documentName: pdfDoc.name, ...pdfDoc.analysis });
     }
 
-    // Otherwise, analyze the PDF
     const pdfStream = await getFromS3(pdfDoc.key);
     const pdfBuffer = await streamToBuffer(pdfStream);
     const analysis = await analyzePdf(pdfBuffer);
 
-    res.json({
-      success: true,
-      documentName: pdfDoc.name,
-      ...analysis
-    });
+    res.json({ success: true, documentName: pdfDoc.name, ...analysis });
   } catch (error) {
     console.error('PDF analysis error:', error);
     res.status(500).json({ error: 'Failed to analyze PDF: ' + error.message });
@@ -280,19 +278,10 @@ router.post('/:jobId/extract', async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    await queueManager.add('extract', {
-      jobId,
-      type: 'extract'
-    }, {
-      jobId: `${jobId}-extract`
-    });
-
+    await queueManager.add('extract', { jobId, type: 'extract' }, { jobId: `${jobId}-extract` });
     updateJobStatus(jobId, { status: 'extracting' });
 
-    res.json({
-      success: true,
-      message: 'Extraction started'
-    });
+    res.json({ success: true, message: 'Extraction started' });
   } catch (error) {
     console.error('Extraction error:', error);
     res.status(500).json({ error: 'Failed to start extraction' });
@@ -304,19 +293,10 @@ router.post('/:jobId/analyze', async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    await queueManager.add('analyze', {
-      jobId,
-      type: 'analyze'
-    }, {
-      jobId: `${jobId}-analyze`
-    });
-
+    await queueManager.add('analyze', { jobId, type: 'analyze' }, { jobId: `${jobId}-analyze` });
     updateJobStatus(jobId, { status: 'analyzing' });
 
-    res.json({
-      success: true,
-      message: 'Analysis started'
-    });
+    res.json({ success: true, message: 'Analysis started' });
   } catch (error) {
     console.error('Analysis error:', error);
     res.status(500).json({ error: 'Failed to start analysis' });
@@ -330,7 +310,6 @@ router.post('/:jobId/resume', async (req, res) => {
     
     console.log(`[Resume] Attempting to resume job: ${jobId}`);
 
-    // Load queue data from S3
     let queueData;
     try {
       queueData = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
@@ -341,7 +320,6 @@ router.post('/:jobId/resume', async (req, res) => {
       });
     }
 
-    // Check current state
     const pendingDocs = queueData.documents.filter(d => d.status === 'pending');
     const completedDocs = queueData.documents.filter(d => d.status === 'completed');
     const failedDocs = queueData.documents.filter(d => d.status === 'failed');
@@ -349,50 +327,26 @@ router.post('/:jobId/resume', async (req, res) => {
     console.log(`[Resume] Job ${jobId} state: ${completedDocs.length} completed, ${failedDocs.length} failed, ${pendingDocs.length} pending`);
 
     if (pendingDocs.length === 0) {
-      // All documents processed - just generate report
       if (queueData.status === 'completed') {
         return res.json({
           success: true,
           message: 'Job already completed',
           status: 'completed',
-          stats: {
-            total: queueData.totalDocuments,
-            completed: completedDocs.length,
-            failed: failedDocs.length,
-            pending: 0
-          }
+          stats: { total: queueData.totalDocuments, completed: completedDocs.length, failed: failedDocs.length, pending: 0 }
         });
       }
 
-      // All processed but report not generated
-      console.log(`[Resume] All documents processed, generating report...`);
-      
-      await queueManager.add('generate-report', {
-        jobId,
-        type: 'generate-report'
-      }, {
-        jobId: `${jobId}-report-resume`
-      });
-
+      await queueManager.add('generate-report', { jobId, type: 'generate-report' }, { jobId: `${jobId}-report-resume` });
       updateJobStatus(jobId, { status: 'generating-report' });
 
       return res.json({
         success: true,
         message: 'All documents already processed. Generating report...',
         status: 'generating-report',
-        stats: {
-          total: queueData.totalDocuments,
-          completed: completedDocs.length,
-          failed: failedDocs.length,
-          pending: 0
-        }
+        stats: { total: queueData.totalDocuments, completed: completedDocs.length, failed: failedDocs.length, pending: 0 }
       });
     }
 
-    // There are pending documents - resume analysis
-    console.log(`[Resume] Resuming analysis for ${pendingDocs.length} pending documents...`);
-
-    // Update metadata to show resuming
     try {
       const metadata = await getJsonFromS3(`jobs/${jobId}/metadata.json`);
       metadata.status = 'processing';
@@ -403,27 +357,14 @@ router.post('/:jobId/resume', async (req, res) => {
       console.error('[Resume] Failed to update metadata:', err.message);
     }
 
-    // Queue the analysis job
-    await queueManager.add('analyze', {
-      jobId,
-      type: 'analyze',
-      isResume: true
-    }, {
-      jobId: `${jobId}-analyze-resume-${Date.now()}`
-    });
-
+    await queueManager.add('analyze', { jobId, type: 'analyze', isResume: true }, { jobId: `${jobId}-analyze-resume-${Date.now()}` });
     updateJobStatus(jobId, { status: 'processing' });
 
     res.json({
       success: true,
       message: `Resuming job. ${pendingDocs.length} documents remaining.`,
       status: 'processing',
-      stats: {
-        total: queueData.totalDocuments,
-        completed: completedDocs.length,
-        failed: failedDocs.length,
-        pending: pendingDocs.length
-      }
+      stats: { total: queueData.totalDocuments, completed: completedDocs.length, failed: failedDocs.length, pending: pendingDocs.length }
     });
   } catch (error) {
     console.error('Resume error:', error);
@@ -436,17 +377,9 @@ router.post('/:jobId/generate-report', async (req, res) => {
   try {
     const { jobId } = req.params;
 
-    await queueManager.add('generate-report', {
-      jobId,
-      type: 'generate-report'
-    }, {
-      jobId: `${jobId}-report`
-    });
+    await queueManager.add('generate-report', { jobId, type: 'generate-report' }, { jobId: `${jobId}-report` });
 
-    res.json({
-      success: true,
-      message: 'Report generation started'
-    });
+    res.json({ success: true, message: 'Report generation started' });
   } catch (error) {
     console.error('Report generation error:', error);
     res.status(500).json({ error: 'Failed to start report generation' });
@@ -458,7 +391,6 @@ router.get('/:jobId/status', async (req, res) => {
   try {
     const { jobId } = req.params;
     
-    // Try memory first, then S3
     let status = getJobStatus(jobId);
     
     if (!status) {
@@ -470,7 +402,6 @@ router.get('/:jobId/status', async (req, res) => {
       }
     }
 
-    // Get queue data if available
     try {
       const queueData = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
       status.queueStatus = queueData.status;
@@ -495,18 +426,9 @@ router.get('/:jobId/logs', async (req, res) => {
     
     try {
       const logsData = await getJsonFromS3(`jobs/${jobId}/processing/logs.json`);
-      res.json({
-        success: true,
-        logs: logsData.logs || [],
-        lastUpdated: logsData.lastUpdated
-      });
+      res.json({ success: true, logs: logsData.logs || [], lastUpdated: logsData.lastUpdated });
     } catch (err) {
-      // No logs file yet
-      res.json({
-        success: true,
-        logs: [],
-        lastUpdated: null
-      });
+      res.json({ success: true, logs: [], lastUpdated: null });
     }
   } catch (error) {
     console.error('Logs error:', error);
@@ -524,18 +446,14 @@ router.get('/:jobId/events', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
 
-  // Send initial connection message
   res.write(`event: connected\ndata: ${JSON.stringify({ jobId })}\n\n`);
 
-  // Add client to SSE subscribers
   addSSEClient(jobId, res);
 
-  // Heartbeat to keep connection alive
   const heartbeat = setInterval(() => {
     res.write(`event: heartbeat\ndata: ${JSON.stringify({ time: Date.now() })}\n\n`);
   }, 30000);
 
-  // Cleanup on close
   req.on('close', () => {
     clearInterval(heartbeat);
     removeSSEClient(jobId, res);
@@ -547,14 +465,8 @@ router.get('/:jobId/download', async (req, res) => {
   try {
     const { jobId } = req.params;
     const reportKey = `jobs/${jobId}/output/Legal_Audit_Report.xlsx`;
-    
     const downloadUrl = await getSignedDownloadUrl(reportKey, 3600);
-    
-    res.json({
-      success: true,
-      downloadUrl,
-      expiresIn: 3600
-    });
+    res.json({ success: true, downloadUrl, expiresIn: 3600 });
   } catch (error) {
     console.error('Download error:', error);
     res.status(500).json({ error: 'Failed to generate download link' });
@@ -566,14 +478,12 @@ router.get('/', async (req, res) => {
   try {
     const objects = await listS3Objects('jobs/');
     
-    // Extract unique job IDs
     const jobIds = new Set();
     objects.forEach(obj => {
       const match = obj.Key.match(/^jobs\/([^\/]+)\//);
       if (match) jobIds.add(match[1]);
     });
 
-    // Get metadata for each job
     const jobs = [];
     for (const jobId of jobIds) {
       try {
@@ -584,7 +494,6 @@ router.get('/', async (req, res) => {
       }
     }
 
-    // Sort by creation date (newest first)
     jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     res.json({ jobs });
