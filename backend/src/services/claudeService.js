@@ -41,7 +41,7 @@ const executeWithRetry = async (fn, retries = 3, delay = 2000) => {
 async function analyzeChunk(chunkText, systemPrompt) {
   const response = await executeWithRetry(async () => {
     const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-sonnet-4-6",
+      modelId: "global.anthropic.claude-sonnet-4-6",
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
