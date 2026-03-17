@@ -38,8 +38,50 @@ const executeWithRetry = async (fn, retries = 3, delay = 2000) => {
 /* CLAUDE CHUNK ANALYSIS                             */
 /* ------------------------------------------------ */
 
-async function analyzeChunk(chunkText, systemPrompt) {
+async function analyzeChunk(chunkContent, systemPrompt, mediaType = 'text') {
   const response = await executeWithRetry(async () => {
+
+    let messageContent;
+
+    if (mediaType === 'pdf') {
+      messageContent = [
+        {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: chunkContent
+          }
+        },
+        {
+          type: "text",
+          text: systemPrompt
+        }
+      ];
+    } else if (mediaType === 'image/png' || mediaType === 'image/jpeg' || mediaType === 'image/gif' || mediaType === 'image/webp') {
+      messageContent = [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mediaType,
+            data: chunkContent
+          }
+        },
+        {
+          type: "text",
+          text: systemPrompt
+        }
+      ];
+    } else {
+      messageContent = [
+        {
+          type: "text",
+          text: `${systemPrompt}\n\n${chunkContent}`
+        }
+      ];
+    }
+
     const command = new InvokeModelCommand({
       modelId: "global.anthropic.claude-sonnet-4-6",
       contentType: "application/json",
@@ -47,17 +89,7 @@ async function analyzeChunk(chunkText, systemPrompt) {
       body: JSON.stringify({
         anthropic_version: "bedrock-2023-05-31",
         max_tokens: 4096,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: `${systemPrompt}\n\n${chunkText}`
-              }
-            ]
-          }
-        ]
+        messages: [{ role: "user", content: messageContent }]
       })
     });
 
@@ -94,11 +126,10 @@ function parseJsonResponse(responseText) {
 }
 
 /* ------------------------------------------------ */
-/* MAIN PDF ANALYSIS ENTRY                           */
+/* SYSTEM PROMPT                                     */
 /* ------------------------------------------------ */
 
-export async function analyzeDocument(documentContent, documentName, mediaType = 'text', options = {}) {
-  const systemPrompt = `You are a legal document audit assistant for a bank/NBFC.
+const SYSTEM_PROMPT = `You are a legal document audit assistant for a bank/NBFC.
 Analyze this legal document and extract structured information.
 Return ONLY a valid JSON object with these exact fields:
 {
@@ -128,6 +159,11 @@ Return ONLY a valid JSON object with these exact fields:
 }
 No markdown. No explanation. Just JSON.`;
 
+/* ------------------------------------------------ */
+/* MAIN PDF ANALYSIS ENTRY                           */
+/* ------------------------------------------------ */
+
+export async function analyzeDocument(documentContent, documentName, mediaType = 'text', options = {}) {
   try {
     const pdfBuffer = options.pdfBuffer;
     const onProgress = options.onProgress;
@@ -140,7 +176,6 @@ No markdown. No explanation. Just JSON.`;
       let totalOutput = 0;
 
       if (analysis.strategy === 'text-chunk') {
-        // Text-based large PDF — split by text chunks
         const chunks = await extractTextChunks(pdfBuffer);
 
         for (let i = 0; i < chunks.length; i++) {
@@ -155,7 +190,7 @@ No markdown. No explanation. Just JSON.`;
             });
           }
 
-          const { responseText, inputTokens, outputTokens } = await analyzeChunk(chunk.content, systemPrompt);
+          const { responseText, inputTokens, outputTokens } = await analyzeChunk(chunk.content, SYSTEM_PROMPT, 'text');
           totalInput += inputTokens;
           totalOutput += outputTokens;
 
@@ -166,7 +201,6 @@ No markdown. No explanation. Just JSON.`;
         }
 
       } else if (analysis.strategy === 'page-split') {
-        // Scanned large PDF — split into page batches
         const batches = await splitPdfIntoBatches(pdfBuffer);
 
         for (let i = 0; i < batches.length; i++) {
@@ -181,7 +215,7 @@ No markdown. No explanation. Just JSON.`;
             });
           }
 
-          const { responseText, inputTokens, outputTokens } = await analyzeChunk(batch.base64, systemPrompt);
+          const { responseText, inputTokens, outputTokens } = await analyzeChunk(batch.base64, SYSTEM_PROMPT, 'pdf');
           totalInput += inputTokens;
           totalOutput += outputTokens;
 
@@ -192,8 +226,8 @@ No markdown. No explanation. Just JSON.`;
         }
 
       } else {
-        // Small PDF — send directly
-        const { responseText, inputTokens, outputTokens } = await analyzeChunk(documentContent, systemPrompt);
+        // direct-pdf or direct-text strategy
+        const { responseText, inputTokens, outputTokens } = await analyzeChunk(documentContent, SYSTEM_PROMPT, 'pdf');
         totalInput += inputTokens;
         totalOutput += outputTokens;
 
@@ -212,8 +246,8 @@ No markdown. No explanation. Just JSON.`;
       };
     }
 
-    // No pdfBuffer — send content directly (small files)
-    const { responseText, inputTokens, outputTokens } = await analyzeChunk(documentContent, systemPrompt);
+    // No pdfBuffer — send content directly (small files, images, text)
+    const { responseText, inputTokens, outputTokens } = await analyzeChunk(documentContent, SYSTEM_PROMPT, mediaType);
     const data = parseJsonResponse(responseText);
 
     return {
