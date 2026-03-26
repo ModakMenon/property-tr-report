@@ -28,27 +28,73 @@ export const jobsApi = {
   create: (userEmail) => fetchApi('/api/jobs/create', { method: 'POST', body: JSON.stringify({ userEmail }) }),
 
   uploadZip: async (jobId, file, onProgress) => {
-    const { uploadUrl, s3Key } = await fetchApi(`/api/jobs/${jobId}/presign-upload`, {
+    const PART_SIZE = 10 * 1024 * 1024; // 10MB per part
+    const partCount = Math.ceil(file.size / PART_SIZE);
+
+    // Step 1 — tell backend to initiate multipart upload on S3
+    // Backend returns: uploadId, s3Key, partUrls (one presigned PUT URL per part)
+    const { uploadId, s3Key, partUrls } = await fetchApi(`/api/jobs/${jobId}/presign-upload`, {
       method: 'POST',
-      body: JSON.stringify({ fileName: file.name, contentType: file.type || 'application/zip' })
+      body: JSON.stringify({
+        fileName: file.name,
+        contentType: file.type || 'application/zip',
+        partCount,
+      })
     });
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.upload.addEventListener('progress', (event) => {
-        if (event.lengthComputable && onProgress) onProgress(Math.round((event.loaded / event.total) * 100));
-      });
-      xhr.addEventListener('load', () => {
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
-        else reject(new Error(`S3 upload failed with status ${xhr.status}`));
-      });
-      xhr.addEventListener('error', () => reject(new Error('Upload failed')));
-      xhr.open('PUT', uploadUrl);
-      xhr.setRequestHeader('Content-Type', file.type || 'application/zip');
-      xhr.send(file);
+
+    // Step 2 — upload each 10MB chunk directly to S3 using its presigned URL
+    // If a part fails, it retries up to 3 times before giving up
+    const parts = [];
+    let uploadedBytes = 0;
+
+    for (let i = 0; i < partCount; i++) {
+      const start = i * PART_SIZE;
+      const end = Math.min(start + PART_SIZE, file.size);
+      const chunk = file.slice(start, end);
+
+      let attempts = 0;
+      let etag;
+
+      while (attempts < 3) {
+        try {
+          const res = await fetch(partUrls[i], {
+            method: 'PUT',
+            body: chunk,
+            headers: { 'Content-Type': file.type || 'application/zip' },
+          });
+          if (!res.ok) throw new Error(`Part ${i + 1} failed with status ${res.status}`);
+          etag = res.headers.get('ETag');
+          break; // success — move to next part
+        } catch (err) {
+          attempts++;
+          if (attempts === 3) {
+            // 3 strikes — abort cleanly so S3 doesn't keep incomplete parts
+            await fetchApi(`/api/jobs/${jobId}/abort-multipart`, {
+              method: 'POST',
+              body: JSON.stringify({ s3Key, uploadId }),
+            }).catch(() => {}); // best-effort abort
+            throw new Error(`Upload failed after 3 attempts on part ${i + 1}: ${err.message}`);
+          }
+          // wait before retry: 2s after 1st fail, 4s after 2nd
+          await new Promise(r => setTimeout(r, 2000 * attempts));
+        }
+      }
+
+      parts.push({ PartNumber: i + 1, ETag: etag });
+      uploadedBytes += (end - start);
+      if (onProgress) onProgress(Math.round((uploadedBytes / file.size) * 100));
+    }
+
+    // Step 3 — tell S3 to assemble all parts into one file
+    await fetchApi(`/api/jobs/${jobId}/complete-multipart`, {
+      method: 'POST',
+      body: JSON.stringify({ s3Key, uploadId, parts }),
     });
+
+    // Step 4 — tell backend upload is confirmed so it can enqueue the job
     return fetchApi(`/api/jobs/${jobId}/confirm-upload`, {
       method: 'POST',
-      body: JSON.stringify({ s3Key, fileName: file.name, fileSize: file.size })
+      body: JSON.stringify({ s3Key, fileName: file.name, fileSize: file.size }),
     });
   },
 
