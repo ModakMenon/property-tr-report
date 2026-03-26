@@ -167,12 +167,27 @@ async function invokeLambda(jobId, document, documentIndex, totalDocuments) {
 
   const command = new InvokeCommand({
     FunctionName: LAMBDA_FUNCTION_NAME,
-    InvocationType: 'Event', // Async invocation — fire and forget
+    InvocationType: 'RequestResponse', // Sync — so we catch errors immediately
     Payload: Buffer.from(payload)
   });
 
-  await lambdaClient.send(command);
-  console.log(`[Worker] Lambda invoked for: ${document.name} (${documentIndex + 1}/${totalDocuments})`);
+  try {
+    const response = await lambdaClient.send(command);
+    
+    // Parse Lambda response
+    const responsePayload = JSON.parse(Buffer.from(response.Payload).toString());
+    
+    if (response.FunctionError) {
+      console.error(`[Worker] Lambda error for ${document.name}:`, JSON.stringify(responsePayload));
+    } else {
+      console.log(`[Worker] Lambda completed for: ${document.name} (${documentIndex + 1}/${totalDocuments}) - Success: ${responsePayload.success}`);
+    }
+    
+    return responsePayload;
+  } catch (error) {
+    console.error(`[Worker] Failed to invoke Lambda for ${document.name}:`, error.message);
+    throw error;
+  }
 }
 
 async function waitForResults(jobId, totalDocuments, onProgress) {
