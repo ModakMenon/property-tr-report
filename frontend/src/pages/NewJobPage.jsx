@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { jobsApi } from '../services/api';
@@ -22,25 +22,128 @@ export default function NewJobPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const fileInputRef = useRef(null);
+
+  // ── ref so SSE unsubscribe survives re-renders ──
+  const unsubscribeRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const jobIdRef = useRef(null); // keep jobId accessible in SSE callbacks
   
-  const [step, setStep] = useState(1); // 1: Create, 2: Upload, 3: Process
+  const [step, setStep] = useState(1);
   const [jobId, setJobId] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false); // ← tracks upload in progress
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [logs, setLogs] = useState([]);
   const [processingStatus, setProcessingStatus] = useState(null);
   const [stats, setStats] = useState({ total: 0, processed: 0, failed: 0 });
-  const [uploadType, setUploadType] = useState('zip'); // 'zip' or 'pdf'
-  const [pdfAnalysis, setPdfAnalysis] = useState(null); // Analysis for large PDFs
-  const [chunkProgress, setChunkProgress] = useState(null); // Track chunk processing
-  const [tokenUsage, setTokenUsage] = useState({ input: 0, output: 0 }); // Track token usage
+  const [uploadType, setUploadType] = useState('zip');
+  const [pdfAnalysis, setPdfAnalysis] = useState(null);
+  const [chunkProgress, setChunkProgress] = useState(null);
+  const [tokenUsage, setTokenUsage] = useState({ input: 0, output: 0 });
+
+  // ── Tab close warning — fires when upload is in progress ──
+  useEffect(() => {
+    const handler = (e) => {
+      if (isUploading) {
+        e.preventDefault();
+        e.returnValue = 'Upload is in progress. If you leave, the upload will be interrupted.';
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [isUploading]);
+
+  // ── Cleanup SSE and reconnect timers on unmount ──
+  useEffect(() => {
+    return () => {
+      if (unsubscribeRef.current) unsubscribeRef.current();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    };
+  }, []);
 
   const addLog = (message, type = 'info') => {
     const time = new Date().toISOString().split('T')[1].split('.')[0];
     setLogs(prev => [...prev, { time, message, type }]);
   };
+
+  // ── SSE subscription with auto-reconnect ──
+  const subscribeWithReconnect = useCallback((id) => {
+    // Clear any existing connection first
+    if (unsubscribeRef.current) {
+      unsubscribeRef.current();
+      unsubscribeRef.current = null;
+    }
+
+    const unsub = jobsApi.subscribeToEvents(id, {
+      onConnected: () => {
+        console.log('[SSE] Connected for job:', id);
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+      },
+      onLog: (data) => {
+        addLog(data.message,
+          data.message.includes('✓') ? 'success' :
+          data.message.includes('❌') ? 'error' :
+          data.message.includes('⚠️') ? 'warning' : 'info'
+        );
+      },
+      onProgress: (data) => {
+        setStats(prev => ({ ...prev, processed: data.current, total: data.total }));
+      },
+      onChunkProgress: (data) => {
+        setChunkProgress(data);
+      },
+      onTokens: (data) => {
+        setTokenUsage({ input: data.totalInput || 0, output: data.totalOutput || 0 });
+      },
+      onExtractionComplete: (data) => {
+        setStats(prev => ({ ...prev, total: data.totalDocuments }));
+        setProcessingStatus('analyzing');
+      },
+      onAnalysisComplete: (data) => {
+        setStats(prev => ({ ...prev, processed: data.processed, failed: data.failed }));
+        if (data.totalTokensInput || data.totalTokensOutput) {
+          setTokenUsage({ input: data.totalTokensInput || 0, output: data.totalTokensOutput || 0 });
+        }
+        setProcessingStatus('generating');
+        setChunkProgress(null);
+      },
+      onComplete: () => {
+        setProcessingStatus('completed');
+        addLog('✓ All processing complete!', 'success');
+        // Clean up SSE — job is done, no need to reconnect
+        if (unsubscribeRef.current) {
+          unsubscribeRef.current();
+          unsubscribeRef.current = null;
+        }
+      },
+      onError: (data) => {
+        const msg = data?.message || 'Unknown error';
+        addLog(`Error: ${msg}`, 'error');
+
+        // ── AUTO-RECONNECT on connection drop ──
+        // Don't reconnect if job is complete or the error is a real job error
+        if (processingStatus !== 'completed' && msg === 'Connection lost') {
+          console.warn('[SSE] Connection lost, reconnecting in 4s...');
+          addLog('Connection lost — reconnecting...', 'warning');
+          reconnectTimerRef.current = setTimeout(() => {
+            const currentJobId = jobIdRef.current;
+            if (currentJobId && processingStatus !== 'completed') {
+              console.log('[SSE] Reconnecting for job:', currentJobId);
+              subscribeWithReconnect(currentJobId);
+            }
+          }, 4000);
+        }
+      }
+    });
+
+    unsubscribeRef.current = unsub;
+    return unsub;
+  }, [processingStatus]);
 
   // Create job
   const handleCreateJob = async () => {
@@ -49,6 +152,7 @@ export default function NewJobPage() {
     try {
       const response = await jobsApi.create(user?.email);
       setJobId(response.jobId);
+      jobIdRef.current = response.jobId; // keep ref in sync
       addLog(`Job created: ${response.jobId}`, 'success');
       setStep(2);
     } catch (err) {
@@ -77,18 +181,18 @@ export default function NewJobPage() {
       setError('');
       addLog(`Selected: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
       
-      // For large PDFs (>20MB), show a notification
       if (isPdf && file.size > 20 * 1024 * 1024) {
         addLog(`Large PDF detected. Will use chunked processing strategy.`, 'warning');
       }
     }
   };
 
-  // Upload file (ZIP or PDF)
+  // Upload file
   const handleUpload = async () => {
     if (!selectedFile) return;
     
     setLoading(true);
+    setIsUploading(true); // ← starts tab-close warning
     setError('');
     addLog(`Uploading ${selectedFile.name}...`);
     
@@ -98,16 +202,16 @@ export default function NewJobPage() {
           setUploadProgress(progress);
         });
         addLog('Upload complete!', 'success');
+        setIsUploading(false); // ← upload done, safe to leave now
         setStep(3);
         await handleStartExtraction();
       } else {
-        // Single PDF upload
         const response = await jobsApi.uploadPdf(jobId, selectedFile, (progress) => {
           setUploadProgress(progress);
         });
         addLog('Upload complete!', 'success');
+        setIsUploading(false); // ← upload done
         
-        // Show PDF analysis if available
         if (response.analysis) {
           setPdfAnalysis(response.analysis);
           addLog(`PDF Analysis: ${response.analysis.pageCount} pages, ${response.analysis.fileSizeMB}MB`, 'info');
@@ -121,6 +225,7 @@ export default function NewJobPage() {
         await handleStartAnalysis();
       }
     } catch (err) {
+      setIsUploading(false); // ← always clear on error too
       setError(err.message);
       addLog(`Upload failed: ${err.message}`, 'error');
     } finally {
@@ -128,106 +233,33 @@ export default function NewJobPage() {
     }
   };
 
-  // Start extraction (for ZIP files)
+  // Start extraction (ZIP)
   const handleStartExtraction = async () => {
     addLog('Starting extraction...');
     setProcessingStatus('extracting');
-    
-    // Connect to SSE
-    const unsubscribe = jobsApi.subscribeToEvents(jobId, {
-      onLog: (data) => {
-        addLog(data.message, data.message.includes('✓') ? 'success' : 
-               data.message.includes('❌') ? 'error' : 
-               data.message.includes('⚠️') ? 'warning' : 'info');
-      },
-      onProgress: (data) => {
-        setStats(prev => ({ ...prev, processed: data.current, total: data.total }));
-      },
-      onChunkProgress: (data) => {
-        setChunkProgress(data);
-      },
-      onTokens: (data) => {
-        setTokenUsage({ input: data.totalInput || 0, output: data.totalOutput || 0 });
-      },
-      onExtractionComplete: (data) => {
-        setStats(prev => ({ ...prev, total: data.totalDocuments }));
-        setProcessingStatus('analyzing');
-      },
-      onAnalysisComplete: (data) => {
-        setStats(prev => ({ ...prev, processed: data.processed, failed: data.failed }));
-        if (data.totalTokensInput || data.totalTokensOutput) {
-          setTokenUsage({ input: data.totalTokensInput || 0, output: data.totalTokensOutput || 0 });
-        }
-        setProcessingStatus('generating');
-        setChunkProgress(null);
-      },
-      onComplete: (data) => {
-        setProcessingStatus('completed');
-        addLog('✓ All processing complete!', 'success');
-      },
-      onError: (data) => {
-        addLog(`Error: ${data?.message || 'Unknown error'}`, 'error');
-      }
-    });
+    subscribeWithReconnect(jobId);
 
     try {
       await jobsApi.startExtraction(jobId);
     } catch (err) {
       addLog(`Error: ${err.message}`, 'error');
     }
-
-    return unsubscribe;
   };
 
-  // Start analysis directly (for single PDF uploads)
+  // Start analysis (single PDF)
   const handleStartAnalysis = async () => {
     addLog('Starting analysis...');
     setProcessingStatus('analyzing');
     setStats(prev => ({ ...prev, total: 1 }));
-    
-    // Connect to SSE
-    const unsubscribe = jobsApi.subscribeToEvents(jobId, {
-      onLog: (data) => {
-        addLog(data.message, data.message.includes('✓') ? 'success' : 
-               data.message.includes('❌') ? 'error' : 
-               data.message.includes('⚠️') ? 'warning' : 'info');
-      },
-      onProgress: (data) => {
-        setStats(prev => ({ ...prev, processed: data.current, total: data.total }));
-      },
-      onChunkProgress: (data) => {
-        setChunkProgress(data);
-      },
-      onTokens: (data) => {
-        setTokenUsage({ input: data.totalInput || 0, output: data.totalOutput || 0 });
-      },
-      onAnalysisComplete: (data) => {
-        setStats(prev => ({ ...prev, processed: data.processed, failed: data.failed }));
-        if (data.totalTokensInput || data.totalTokensOutput) {
-          setTokenUsage({ input: data.totalTokensInput || 0, output: data.totalTokensOutput || 0 });
-        }
-        setProcessingStatus('generating');
-        setChunkProgress(null);
-      },
-      onComplete: (data) => {
-        setProcessingStatus('completed');
-        addLog('✓ All processing complete!', 'success');
-      },
-      onError: (data) => {
-        addLog(`Error: ${data?.message || 'Unknown error'}`, 'error');
-      }
-    });
+    subscribeWithReconnect(jobId);
 
     try {
       await jobsApi.startAnalysis(jobId);
     } catch (err) {
       addLog(`Error: ${err.message}`, 'error');
     }
-
-    return unsubscribe;
   };
 
-  // View results
   const handleViewResults = () => {
     navigate(`/job/${jobId}`);
   };
@@ -290,11 +322,7 @@ export default function NewJobPage() {
             disabled={loading}
             className="btn-primary inline-flex items-center gap-2"
           >
-            {loading ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
-              <Play className="w-5 h-5" />
-            )}
+            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
             Create Job
           </button>
         </div>
@@ -375,16 +403,15 @@ export default function NewJobPage() {
                   </div>
                 </div>
                 <button
-                  onClick={() => {
-                    setSelectedFile(null);
-                    setPdfAnalysis(null);
-                  }}
+                  onClick={() => { setSelectedFile(null); setPdfAnalysis(null); }}
                   className="p-2 text-gray-400 hover:text-gray-600"
+                  disabled={isUploading}
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
+              {/* Upload progress bar */}
               {uploadProgress > 0 && uploadProgress < 100 && (
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
@@ -397,6 +424,11 @@ export default function NewJobPage() {
                       style={{ width: `${uploadProgress}%` }}
                     />
                   </div>
+                  {isUploading && (
+                    <p className="text-xs text-amber-600 flex items-center gap-1">
+                      ⚠️ Upload in progress — do not close this tab
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -405,11 +437,7 @@ export default function NewJobPage() {
                 disabled={loading}
                 className="w-full btn-primary inline-flex items-center justify-center gap-2"
               >
-                {loading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  <Upload className="w-5 h-5" />
-                )}
+                {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Upload className="w-5 h-5" />}
                 Upload & Start Processing
               </button>
             </div>
@@ -420,7 +448,6 @@ export default function NewJobPage() {
       {/* Step 3: Processing */}
       {step === 3 && (
         <div className="space-y-6">
-          {/* PDF Analysis Preview (for large PDFs) */}
           {pdfAnalysis && pdfAnalysis.estimatedChunks > 1 && (
             <div className="card p-4 bg-amber-50 border-amber-200">
               <div className="flex items-start gap-3">
@@ -469,13 +496,13 @@ export default function NewJobPage() {
                 </p>
               </div>
               <p className="text-xs text-gray-500">
-                {tokenUsage.input > 0 && `${(tokenUsage.input / 1000).toFixed(1)}K↓ ${(tokenUsage.output / 1000).toFixed(1)}K↑`}
-                {tokenUsage.input === 0 && 'Tokens'}
+                {tokenUsage.input > 0
+                  ? `${(tokenUsage.input / 1000).toFixed(1)}K↓ ${(tokenUsage.output / 1000).toFixed(1)}K↑`
+                  : 'Tokens'}
               </p>
             </div>
           </div>
 
-          {/* Chunk progress (for large PDFs) */}
           {chunkProgress && (
             <div className="card p-4 bg-blue-50 border-blue-200">
               <div className="flex items-center justify-between text-sm mb-2">
@@ -493,13 +520,10 @@ export default function NewJobPage() {
                   style={{ width: `${(chunkProgress.current / chunkProgress.total) * 100}%` }}
                 />
               </div>
-              <p className="text-xs text-blue-600 mt-2">
-                Document: {chunkProgress.document}
-              </p>
+              <p className="text-xs text-blue-600 mt-2">Document: {chunkProgress.document}</p>
             </div>
           )}
 
-          {/* Progress bar */}
           {stats.total > 0 && (
             <div className="card p-4">
               <div className="flex justify-between text-sm mb-2">
@@ -524,7 +548,6 @@ export default function NewJobPage() {
             </div>
           )}
 
-          {/* Action button */}
           {processingStatus === 'completed' && (
             <button
               onClick={handleViewResults}
@@ -561,7 +584,6 @@ export default function NewJobPage() {
         </div>
       )}
 
-      {/* Job ID display */}
       {jobId && (
         <div className="text-center text-sm text-gray-500">
           Job ID: <span className="font-mono text-gray-700">{jobId}</span>

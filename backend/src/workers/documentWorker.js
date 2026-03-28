@@ -7,8 +7,9 @@ import { generateAuditReport } from '../services/excelService.js';
 
 const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || 'ap-south-1' });
 const LAMBDA_FUNCTION_NAME = process.env.LAMBDA_FUNCTION_NAME || 'legal-audit-document-processor';
-const LAMBDA_BATCH_SIZE = 50; // Process 50 documents in parallel at a time
-const POLL_INTERVAL = 5000; // Check completion every 5 seconds
+const LAMBDA_BATCH_SIZE = 10;   // ← reduced from 50 to 10 to avoid Bedrock rate limits
+const BATCH_DELAY_MS   = 8000;  // ← 8 second pause between batches (gives Bedrock time to recover)
+const POLL_INTERVAL    = 5000;
 
 let worker = null;
 
@@ -159,45 +160,64 @@ async function processExtraction(jobId, job) {
 }
 
 /* ------------------------------------------------ */
-/* ANALYSIS - LAMBDA PARALLEL                        */
+/* ANALYSIS - LAMBDA WITH RATE LIMIT PROTECTION     */
 /* ------------------------------------------------ */
 
-async function invokeLambda(jobId, document, documentIndex, totalDocuments) {
+async function invokeLambdaWithRetry(jobId, document, documentIndex, totalDocuments, maxRetries = 3) {
   const payload = JSON.stringify({ jobId, document, documentIndex, totalDocuments });
 
-  const command = new InvokeCommand({
-    FunctionName: LAMBDA_FUNCTION_NAME,
-    InvocationType: 'RequestResponse', // Sync — so we catch errors immediately
-    Payload: Buffer.from(payload)
-  });
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const command = new InvokeCommand({
+        FunctionName: LAMBDA_FUNCTION_NAME,
+        InvocationType: 'RequestResponse',
+        Payload: Buffer.from(payload)
+      });
 
-  try {
-    const response = await lambdaClient.send(command);
-    
-    // Parse Lambda response
-    const responsePayload = JSON.parse(Buffer.from(response.Payload).toString());
-    
-    if (response.FunctionError) {
-      console.error(`[Worker] Lambda error for ${document.name}:`, JSON.stringify(responsePayload));
-    } else {
-      console.log(`[Worker] Lambda completed for: ${document.name} (${documentIndex + 1}/${totalDocuments}) - Success: ${responsePayload.success}`);
+      const response = await lambdaClient.send(command);
+      const responsePayload = JSON.parse(Buffer.from(response.Payload).toString());
+
+      // Check if Bedrock throttled inside Lambda
+      if (response.FunctionError) {
+        const errMsg = JSON.stringify(responsePayload);
+        const isThrottle = errMsg.includes('ThrottlingException') ||
+                           errMsg.includes('Rate exceeded') ||
+                           errMsg.includes('Too Many Requests');
+
+        if (isThrottle && attempt < maxRetries) {
+          const waitMs = 15000 * attempt; // 15s, 30s
+          console.warn(`[Worker] Bedrock throttle on ${document.name}, waiting ${waitMs}ms before retry ${attempt + 1}/${maxRetries}`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+
+        console.error(`[Worker] Lambda error for ${document.name}:`, errMsg);
+      } else {
+        console.log(`[Worker] Lambda completed: ${document.name} (${documentIndex + 1}/${totalDocuments})`);
+      }
+
+      return responsePayload;
+
+    } catch (error) {
+      if (attempt < maxRetries) {
+        const waitMs = 10000 * attempt;
+        console.warn(`[Worker] Lambda invoke failed for ${document.name}, retry ${attempt + 1}/${maxRetries} in ${waitMs}ms:`, error.message);
+        await new Promise(r => setTimeout(r, waitMs));
+      } else {
+        console.error(`[Worker] Lambda failed after ${maxRetries} attempts for ${document.name}:`, error.message);
+        throw error;
+      }
     }
-    
-    return responsePayload;
-  } catch (error) {
-    console.error(`[Worker] Failed to invoke Lambda for ${document.name}:`, error.message);
-    throw error;
   }
 }
 
-async function waitForResults(jobId, totalDocuments, onProgress) {
+async function waitForResults(jobId, totalDocuments) {
   const timestamp = () => new Date().toISOString().split('T')[1].split('.')[0];
   let lastCompleted = 0;
 
   console.log(`[Worker] Waiting for ${totalDocuments} Lambda results...`);
 
   while (true) {
-    // Count completed result files in S3
     let completedCount = 0;
     try {
       const objects = await listS3Objects(`jobs/${jobId}/processing/results/`);
@@ -206,7 +226,6 @@ async function waitForResults(jobId, totalDocuments, onProgress) {
       completedCount = 0;
     }
 
-    // Report progress if changed
     if (completedCount > lastCompleted) {
       const message = `[${completedCount}/${totalDocuments}] Documents processed by Lambda...`;
       await saveJobLog(jobId, timestamp(), message);
@@ -219,13 +238,11 @@ async function waitForResults(jobId, totalDocuments, onProgress) {
       lastCompleted = completedCount;
     }
 
-    // All done?
     if (completedCount >= totalDocuments) {
       console.log(`[Worker] All ${totalDocuments} Lambda results received!`);
       break;
     }
 
-    // Wait before checking again
     await new Promise(r => setTimeout(r, POLL_INTERVAL));
   }
 }
@@ -270,58 +287,55 @@ async function processAnalysis(jobId, job) {
     return;
   }
 
-  const startMsg = `Starting parallel Lambda analysis of ${pendingDocs.length} documents...`;
+  const totalBatches = Math.ceil(pendingDocs.length / LAMBDA_BATCH_SIZE);
+  const startMsg = `Starting parallel Lambda analysis of ${pendingDocs.length} documents in ${totalBatches} batches of ${LAMBDA_BATCH_SIZE}...`;
   await saveJobLog(jobId, timestamp(), startMsg);
   broadcastToJob(jobId, 'log', { time: timestamp(), message: startMsg });
   updateJobStatus(jobId, { status: 'processing' });
 
-  // Clear any old result files
-  console.log(`[Worker] Starting Lambda parallel processing for ${pendingDocs.length} documents`);
-
-  // Fire Lambdas in batches of LAMBDA_BATCH_SIZE
+  // ── Fire Lambdas in small batches with a delay between each ──
   for (let batchStart = 0; batchStart < pendingDocs.length; batchStart += LAMBDA_BATCH_SIZE) {
     const batch = pendingDocs.slice(batchStart, batchStart + LAMBDA_BATCH_SIZE);
     const batchEnd = Math.min(batchStart + LAMBDA_BATCH_SIZE, pendingDocs.length);
+    const batchNum = Math.floor(batchStart / LAMBDA_BATCH_SIZE) + 1;
 
-    const batchMsg = `Invoking Lambda for documents ${batchStart + 1}-${batchEnd} of ${pendingDocs.length}...`;
+    const batchMsg = `Invoking Lambda batch ${batchNum}/${totalBatches} — docs ${batchStart + 1}–${batchEnd} of ${pendingDocs.length}`;
     await saveJobLog(jobId, timestamp(), batchMsg);
     broadcastToJob(jobId, 'log', { time: timestamp(), message: batchMsg });
 
-    // Invoke all Lambdas in this batch simultaneously
-    const invokePromises = batch.map((doc, idx) => {
-      const globalIndex = batchStart + idx;
-      return invokeLambda(jobId, doc, globalIndex, pendingDocs.length);
-    });
+    // Invoke this batch in parallel — each with built-in retry on throttle
+    const invokePromises = batch.map((doc, idx) =>
+      invokeLambdaWithRetry(jobId, doc, batchStart + idx, pendingDocs.length)
+    );
 
-    await Promise.all(invokePromises);
+    // Wait for ALL invocations in this batch before moving to the next
+    const batchResults = await Promise.allSettled(invokePromises);
 
-    const invokedMsg = `✓ ${batch.length} Lambda functions invoked for batch ${Math.floor(batchStart / LAMBDA_BATCH_SIZE) + 1}`;
-    await saveJobLog(jobId, timestamp(), invokedMsg);
+    const batchFailed = batchResults.filter(r => r.status === 'rejected').length;
+    const invokedMsg = batchFailed > 0
+      ? `⚠️ Batch ${batchNum} done — ${batch.length - batchFailed} succeeded, ${batchFailed} failed`
+      : `✓ Batch ${batchNum}/${totalBatches} complete (${batch.length} docs)`;
+
+    await saveJobLog(jobId, timestamp(), invokedMsg, batchFailed > 0 ? 'warning' : 'success');
     broadcastToJob(jobId, 'log', { time: timestamp(), message: invokedMsg });
 
-    // Small delay between batches to avoid overwhelming Bedrock
+    // ── RATE LIMIT GUARD: pause between batches so Bedrock doesn't throttle ──
     if (batchEnd < pendingDocs.length) {
-      await new Promise(r => setTimeout(r, 2000));
+      const delayMsg = `Pausing ${BATCH_DELAY_MS / 1000}s before next batch to avoid Bedrock rate limits...`;
+      await saveJobLog(jobId, timestamp(), delayMsg);
+      broadcastToJob(jobId, 'log', { time: timestamp(), message: delayMsg });
+      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
     }
   }
 
-  const waitMsg = `All ${pendingDocs.length} Lambda functions invoked! Waiting for results...`;
+  const waitMsg = `All Lambda batches fired! Waiting for all ${pendingDocs.length} results...`;
   await saveJobLog(jobId, timestamp(), waitMsg);
   broadcastToJob(jobId, 'log', { time: timestamp(), message: waitMsg });
 
-  // Wait for all Lambda results to be written to S3
-  await waitForResults(jobId, pendingDocs.length, (completed) => {
-    broadcastToJob(jobId, 'progress', {
-      current: completed,
-      total: pendingDocs.length,
-      percentage: Math.round((completed / pendingDocs.length) * 100)
-    });
-  });
+  await waitForResults(jobId, pendingDocs.length);
 
-  // Collect all results from S3
   const { results, failedDocuments, totalInput, totalOutput } = await collectResults(jobId, pendingDocs);
 
-  // Update queue data
   queueData.results = results;
   queueData.failedDocuments = failedDocuments;
   queueData.processedCount = pendingDocs.length;
@@ -329,7 +343,6 @@ async function processAnalysis(jobId, job) {
   queueData.totalTokensOutput = totalOutput;
   queueData.status = 'analysis-complete';
 
-  // Mark all documents as completed/failed
   queueData.documents = queueData.documents.map(doc => ({
     ...doc,
     status: failedDocuments.find(f => f.name === doc.name) ? 'failed' : 'completed'
@@ -461,7 +474,7 @@ export async function initializeWorker() {
     worker.on('stalled', (jobId) => console.warn(`[Worker] Job ${jobId} stalled - will retry`));
     worker.on('error', (err) => console.error(`[Worker] Worker error:`, err.message));
 
-    console.log('✓ BullMQ worker initialized with Lambda parallel processing');
+    console.log(`✓ BullMQ worker initialized — batch size: ${LAMBDA_BATCH_SIZE}, batch delay: ${BATCH_DELAY_MS}ms`);
     return worker;
 
   } catch (err) {
