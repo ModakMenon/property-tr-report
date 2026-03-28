@@ -1,12 +1,18 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import Busboy from 'busboy';
+import { S3Client, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { uploadStreamToS3, uploadToS3, getJsonFromS3, putJsonToS3, listS3Objects, getSignedDownloadUrl, getFromS3, streamToBuffer, getSignedUploadUrl } from '../services/s3Service.js';
 import { queueManager, addSSEClient, removeSSEClient, getJobStatus, setJobStatus, updateJobStatus } from '../services/queueService.js';
 import { getDocumentAnalysis } from '../services/claudeService.js';
 import { analyzePdf } from '../services/pdfChunkService.js';
 
 const router = express.Router();
+
+// S3 client for multipart operations
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const BUCKET = process.env.S3_BUCKET_NAME;
 
 // Create a new job
 router.post('/create', async (req, res) => {
@@ -33,25 +39,109 @@ router.post('/create', async (req, res) => {
   }
 });
 
-// Step 1: Generate presigned URL for direct browser → S3 upload (bypasses CloudFront/ALB)
+// ─────────────────────────────────────────────────────────────
+// MULTIPART UPLOAD — Step 1
+// Initiates multipart upload on S3, returns one presigned PUT
+// URL per part so the browser uploads chunks directly to S3.
+// partCount is calculated by the frontend: ceil(fileSize / 10MB)
+// ─────────────────────────────────────────────────────────────
 router.post('/:jobId/presign-upload', async (req, res) => {
   const { jobId } = req.params;
-  const { fileName, contentType } = req.body;
+  const { fileName, contentType, partCount } = req.body;
 
   try {
     const s3Key = `jobs/${jobId}/uploads/raw/documents.zip`;
-    const uploadUrl = await getSignedUploadUrl(s3Key, contentType || 'application/zip', 3600);
 
-    console.log(`[Presign] Generated upload URL for job: ${jobId}`);
+    // Tell S3 we're starting a multipart upload
+    const multipart = await s3Client.send(new CreateMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: s3Key,
+      ContentType: contentType || 'application/zip',
+    }));
 
-    res.json({ success: true, uploadUrl, s3Key });
+    const uploadId = multipart.UploadId;
+
+    // Generate a presigned PUT URL for each part (expires in 1 hour)
+    const partUrls = await Promise.all(
+      Array.from({ length: partCount }, (_, i) =>
+        getSignedUrl(
+          s3Client,
+          new UploadPartCommand({
+            Bucket: BUCKET,
+            Key: s3Key,
+            UploadId: uploadId,
+            PartNumber: i + 1,
+          }),
+          { expiresIn: 3600 }
+        )
+      )
+    );
+
+    console.log(`[Presign] Multipart initiated for job: ${jobId}, parts: ${partCount}, uploadId: ${uploadId}`);
+    res.json({ success: true, uploadId, s3Key, partUrls });
+
   } catch (error) {
-    console.error('[Presign] Error generating presigned URL:', error);
-    res.status(500).json({ error: 'Failed to generate upload URL' });
+    console.error('[Presign] Error initiating multipart upload:', error);
+    res.status(500).json({ error: 'Failed to initiate upload' });
   }
 });
 
-// Step 2: Confirm upload complete and update job status
+// ─────────────────────────────────────────────────────────────
+// MULTIPART UPLOAD — Step 2
+// Called after all parts are uploaded. Tells S3 to assemble
+// the parts into a single file.
+// Body: { s3Key, uploadId, parts: [{ PartNumber, ETag }] }
+// ─────────────────────────────────────────────────────────────
+router.post('/:jobId/complete-multipart', async (req, res) => {
+  const { jobId } = req.params;
+  const { s3Key, uploadId, parts } = req.body;
+
+  try {
+    await s3Client.send(new CompleteMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: s3Key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
+    }));
+
+    console.log(`[Multipart] Completed for job: ${jobId}, key: ${s3Key}`);
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('[Multipart] Complete failed:', error);
+    res.status(500).json({ error: 'Failed to complete upload' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// MULTIPART UPLOAD — Abort (cleanup on error or cancel)
+// Tells S3 to discard all uploaded parts so you don't get
+// charged for incomplete multipart storage.
+// ─────────────────────────────────────────────────────────────
+router.post('/:jobId/abort-multipart', async (req, res) => {
+  const { jobId } = req.params;
+  const { s3Key, uploadId } = req.body;
+
+  try {
+    await s3Client.send(new AbortMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: s3Key,
+      UploadId: uploadId,
+    }));
+    console.log(`[Multipart] Aborted for job: ${jobId}`);
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('[Multipart] Abort failed:', error);
+    res.status(500).json({ error: 'Failed to abort upload' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// CONFIRM UPLOAD — Step 3
+// Called after complete-multipart succeeds. Updates job status
+// to 'uploaded' so the worker knows it can start processing.
+// ─────────────────────────────────────────────────────────────
 router.post('/:jobId/confirm-upload', async (req, res) => {
   const { jobId } = req.params;
   const { s3Key, fileName, fileSize } = req.body;
