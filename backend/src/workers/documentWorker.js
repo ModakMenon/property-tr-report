@@ -1,22 +1,30 @@
 import { Worker } from 'bullmq';
 import unzipper from 'unzipper';
-import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-import { getWorkerConnection, isUsingInMemoryQueue, broadcastToJob, updateJobStatus, getJobStatus, registerJobHandler, documentQueue } from '../services/queueService.js';
-import { getFromS3, uploadToS3, getJsonFromS3, putJsonToS3, streamToBuffer, listS3Objects } from '../services/s3Service.js';
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
+import pdf from 'pdf-parse';
+import { PDFDocument } from 'pdf-lib';
+import {
+  getWorkerConnection, isUsingInMemoryQueue,
+  broadcastToJob, updateJobStatus, registerJobHandler
+} from '../services/queueService.js';
+import { getFromS3, uploadToS3, getJsonFromS3, putJsonToS3 } from '../services/s3Service.js';
 import { generateAuditReport } from '../services/excelService.js';
 
-const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || 'ap-south-1' });
-const LAMBDA_FUNCTION_NAME = process.env.LAMBDA_FUNCTION_NAME || 'legal-audit-document-processor';
-const LAMBDA_BATCH_SIZE = 10;   // ← reduced from 50 to 10 to avoid Bedrock rate limits
-const BATCH_DELAY_MS   = 8000;  // ← 8 second pause between batches (gives Bedrock time to recover)
-const POLL_INTERVAL    = 5000;
+/* ────────────────────────────────────────────────
+   CONFIG
+   ──────────────────────────────────────────────── */
+const CONCURRENCY     = 50;               // simultaneous Bedrock calls
+const MAX_DIRECT_SIZE = 10 * 1024 * 1024; // 10 MB → send PDF directly
+const TEXT_CHUNK_SIZE = 40000;
+const MAX_PAGES_BATCH = 5;
+const REGION          = process.env.AWS_REGION || 'ap-south-1';
 
+const bedrockClient = new BedrockRuntimeClient({ region: REGION });
 let worker = null;
 
-/* ------------------------------------------------ */
-/* LOG HELPERS                                       */
-/* ------------------------------------------------ */
-
+/* ────────────────────────────────────────────────
+   LOG HELPERS
+   ──────────────────────────────────────────────── */
 const logCache = new Map();
 
 async function saveJobLog(jobId, time, message, type = 'info') {
@@ -27,469 +35,579 @@ async function saveJobLog(jobId, time, message, type = 'info') {
 
 async function flushJobLogs(jobId) {
   const logs = logCache.get(jobId);
-  if (!logs || logs.length === 0) return;
+  if (!logs?.length) return;
   try {
-    let existingLogs = [];
-    try {
-      const existing = await getJsonFromS3(`jobs/${jobId}/processing/logs.json`);
-      existingLogs = existing.logs || [];
-    } catch { }
-    const allLogs = [...existingLogs, ...logs].slice(-1000);
-    await putJsonToS3(`jobs/${jobId}/processing/logs.json`, { logs: allLogs, lastUpdated: new Date().toISOString() });
+    let existing = [];
+    try { existing = (await getJsonFromS3(`jobs/${jobId}/processing/logs.json`)).logs || []; } catch {}
+    await putJsonToS3(`jobs/${jobId}/processing/logs.json`, {
+      logs: [...existing, ...logs].slice(-1000),
+      lastUpdated: new Date().toISOString()
+    });
     logCache.set(jobId, []);
-  } catch (err) {
-    console.error(`[Logs] Failed to flush:`, err.message);
+  } catch (err) { console.error('[Logs] flush failed:', err.message); }
+}
+
+const finalizeJobLogs = (jobId) => flushJobLogs(jobId);
+
+/* ────────────────────────────────────────────────
+   CHECKPOINT HELPERS
+   Every completed/failed doc is written immediately
+   to jobs/{jobId}/processing/results/{idx}.json
+   so a worker restart can skip already-done docs.
+   ──────────────────────────────────────────────── */
+async function isDocAlreadyDone(jobId, docIndex) {
+  try {
+    const r = await getJsonFromS3(`jobs/${jobId}/processing/results/${docIndex}.json`);
+    return r.status === 'completed' || r.status === 'failed';
+  } catch { return false; }
+}
+
+/* ────────────────────────────────────────────────
+   SYSTEM PROMPT — from S3 masters
+   ──────────────────────────────────────────────── */
+async function getSystemPrompt() {
+  try {
+    const buf     = await getFromS3('masters/legal_audit_prompt.json');
+    const masters = JSON.parse(buf.toString());
+    return `You are a legal document audit assistant for a bank/NBFC.
+${masters.systemRole || ''}
+Analyze this legal document and extract structured information.
+Return ONLY a valid JSON object with these exact fields:
+{
+  "appl_no":"string","borrower_name":"string","property_address":"string",
+  "property_type":"string","state":"string","tsr_date":"string",
+  "ownership_title_chain_status":"string","encumbrances_adverse_entries":"string",
+  "subsequent_charges":"string","prior_charge_subsisting":"string",
+  "roc_charge_flag":"string","litigation_lis_pendens":"string",
+  "mutation_status":"string","revenue_municipal_dues":"string",
+  "land_use_zoning_status":"string","stamping_registration_issues":"string",
+  "mortgage_perfection_issues":"string","advocate_adverse_remarks":"string",
+  "risk_rating":"High|Medium|Low","enforceability_decision":"string",
+  "enforceability_rationale":"string","recommended_actions":"string",
+  "confidence_score":0.0
+}
+No markdown. No explanation. Just JSON.`;
+  } catch {
+    return `You are a legal document audit assistant for a bank/NBFC.
+Analyze this legal document and extract structured information.
+Return ONLY a valid JSON object with these exact fields:
+{
+  "appl_no":"string","borrower_name":"string","property_address":"string",
+  "property_type":"string","state":"string","tsr_date":"string",
+  "ownership_title_chain_status":"string","encumbrances_adverse_entries":"string",
+  "subsequent_charges":"string","prior_charge_subsisting":"string",
+  "roc_charge_flag":"string","litigation_lis_pendens":"string",
+  "mutation_status":"string","revenue_municipal_dues":"string",
+  "land_use_zoning_status":"string","stamping_registration_issues":"string",
+  "mortgage_perfection_issues":"string","advocate_adverse_remarks":"string",
+  "risk_rating":"High|Medium|Low","enforceability_decision":"string",
+  "enforceability_rationale":"string","recommended_actions":"string",
+  "confidence_score":0.0
+}
+No markdown. No explanation. Just JSON.`;
   }
 }
 
-async function finalizeJobLogs(jobId) {
-  await flushJobLogs(jobId);
+/* ────────────────────────────────────────────────
+   BEDROCK CALL  (with throttle-aware retry)
+   ──────────────────────────────────────────────── */
+function parseJsonResponse(text) {
+  try { return JSON.parse(text); } catch {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch {} }
+    return null;
+  }
 }
 
-/* ------------------------------------------------ */
-/* JOB PROCESSOR                                     */
-/* ------------------------------------------------ */
+async function callBedrock(content, mediaType, systemPrompt, retries = 3) {
+  let messageContent;
+  if (mediaType === 'pdf') {
+    messageContent = [
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: content } },
+      { type: 'text', text: systemPrompt }
+    ];
+  } else if (mediaType.startsWith('image/')) {
+    messageContent = [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: content } },
+      { type: 'text', text: systemPrompt }
+    ];
+  } else {
+    messageContent = [{ type: 'text', text: `${systemPrompt}\n\n${content}` }];
+  }
 
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const cmd    = new InvokeModelCommand({
+        modelId: 'global.anthropic.claude-sonnet-4-6',
+        contentType: 'application/json', accept: 'application/json',
+        body: JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 4096,
+          messages: [{ role: 'user', content: messageContent }]
+        })
+      });
+      const result   = await bedrockClient.send(cmd);
+      const response = JSON.parse(new TextDecoder().decode(result.body));
+      return {
+        text:         response.content?.[0]?.text || '',
+        inputTokens:  response.usage?.input_tokens  || 0,
+        outputTokens: response.usage?.output_tokens || 0
+      };
+    } catch (err) {
+      const throttle = err.message?.includes('ThrottlingException') ||
+                       err.message?.includes('Rate exceeded') ||
+                       err.message?.includes('Too Many Requests');
+      if (attempt < retries) {
+        const wait = throttle ? 12000 * attempt : 3000 * attempt;
+        console.warn(`[Bedrock] retry ${attempt}/${retries} in ${wait}ms — ${err.message}`);
+        await new Promise(r => setTimeout(r, wait));
+      } else throw err;
+    }
+  }
+}
+
+/* ────────────────────────────────────────────────
+   PROCESS ONE DOCUMENT  (identical logic to Lambda)
+   ──────────────────────────────────────────────── */
+async function processDocument(docBuffer, docType, systemPrompt) {
+  let chunks = [], totalInput = 0, totalOutput = 0;
+
+  if (docType === '.pdf') {
+    if (docBuffer.length <= MAX_DIRECT_SIZE) {
+      const { text, inputTokens, outputTokens } =
+        await callBedrock(docBuffer.toString('base64'), 'pdf', systemPrompt);
+      totalInput += inputTokens; totalOutput += outputTokens;
+      const d = parseJsonResponse(text); if (d) chunks.push(d);
+    } else {
+      let pdfData; try { pdfData = await pdf(docBuffer); } catch {}
+      const hasText = pdfData?.text?.trim().length > 500;
+
+      if (hasText) {
+        const paragraphs = pdfData.text.split(/\n\s*\n/);
+        let cur = ''; const parts = [];
+        for (const p of paragraphs) {
+          if (cur.length + p.length > TEXT_CHUNK_SIZE && cur.length > 0) { parts.push(cur.trim()); cur = p; }
+          else cur += (cur ? '\n\n' : '') + p;
+        }
+        if (cur.trim()) parts.push(cur.trim());
+        for (const part of parts) {
+          const { text, inputTokens, outputTokens } = await callBedrock(part, 'text', systemPrompt);
+          totalInput += inputTokens; totalOutput += outputTokens;
+          const d = parseJsonResponse(text); if (d) chunks.push(d);
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } else {
+        const pdfDoc  = await PDFDocument.load(docBuffer, { ignoreEncryption: true });
+        const maxPages = Math.min(pdfDoc.getPageCount(), 500);
+        for (let i = 0; i < maxPages; i += MAX_PAGES_BATCH) {
+          const idx = []; for (let j = i; j < Math.min(i + MAX_PAGES_BATCH, maxPages); j++) idx.push(j);
+          const batch = await PDFDocument.create();
+          (await batch.copyPages(pdfDoc, idx)).forEach(p => batch.addPage(p));
+          const { text, inputTokens, outputTokens } =
+            await callBedrock(Buffer.from(await batch.save()).toString('base64'), 'pdf', systemPrompt);
+          totalInput += inputTokens; totalOutput += outputTokens;
+          const d = parseJsonResponse(text); if (d) chunks.push(d);
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    }
+  } else if (['.png', '.jpg', '.jpeg'].includes(docType)) {
+    const mt = docType === '.png' ? 'image/png' : 'image/jpeg';
+    const { text, inputTokens, outputTokens } =
+      await callBedrock(docBuffer.toString('base64'), mt, systemPrompt);
+    totalInput += inputTokens; totalOutput += outputTokens;
+    const d = parseJsonResponse(text); if (d) chunks.push(d);
+  } else {
+    const { text, inputTokens, outputTokens } =
+      await callBedrock(docBuffer.toString('utf-8'), 'text', systemPrompt);
+    totalInput += inputTokens; totalOutput += outputTokens;
+    const d = parseJsonResponse(text); if (d) chunks.push(d);
+  }
+
+  if (!chunks.length) return { success: false, data: null, totalInput, totalOutput };
+  if (chunks.length === 1) return { success: true, data: chunks[0], totalInput, totalOutput };
+
+  // Merge multiple chunks — worst risk wins
+  const rp = ['High', 'Medium', 'Low', 'Manual Review Required', 'Unknown'];
+  const merged = { ...chunks[0] };
+  for (let i = 1; i < chunks.length; i++) {
+    const r = chunks[i];
+    const ci = rp.indexOf(merged.risk_rating), ni = rp.indexOf(r.risk_rating);
+    if (ni !== -1 && (ci === -1 || ni < ci)) merged.risk_rating = r.risk_rating;
+    ['property_address','enforceability_rationale','recommended_actions','advocate_adverse_remarks']
+      .forEach(f => {
+        if (r[f] && r[f] !== 'Unknown' && merged[f] && !merged[f].includes(r[f]))
+          merged[f] = `${merged[f]}; ${r[f]}`;
+      });
+  }
+  const scores = chunks.map(r => r.confidence_score).filter(s => typeof s === 'number');
+  if (scores.length) merged.confidence_score = Math.round(scores.reduce((a,b)=>a+b,0)/scores.length);
+  return { success: true, data: merged, totalInput, totalOutput };
+}
+
+/* ────────────────────────────────────────────────
+   PROCESS ONE DOC WRAPPER
+   — skips if already done (crash-resume support)
+   — writes result to S3 immediately (checkpoint)
+   ──────────────────────────────────────────────── */
+async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt) {
+  // ── CHECKPOINT: skip if this doc was already processed ──
+  if (await isDocAlreadyDone(jobId, docIndex)) {
+    console.log(`[Worker] ↩ Skipping already-done doc ${docIndex}: ${doc.name}`);
+    // Re-read the existing result so token counts are preserved
+    try {
+      const existing = await getJsonFromS3(`jobs/${jobId}/processing/results/${docIndex}.json`);
+      return {
+        success: existing.status === 'completed',
+        docName: doc.name,
+        input:   existing.tokenDetails?.input  || 0,
+        output:  existing.tokenDetails?.output || 0,
+        skipped: true
+      };
+    } catch { return { success: true, docName: doc.name, input: 0, output: 0, skipped: true }; }
+  }
+
+  try {
+    const docBuffer = await getFromS3(doc.key);
+    const { success, data, totalInput, totalOutput } =
+      await processDocument(docBuffer, doc.type, systemPrompt);
+
+    const resultKey = `jobs/${jobId}/processing/results/${docIndex}.json`;
+
+    if (success && data && data.confidence_score > 0) {
+      data.document_name = doc.name;
+      data.processed_at  = new Date().toISOString();
+      // ── CHECKPOINT WRITE — immediately persisted to S3 ──
+      await putJsonToS3(resultKey, {
+        status: 'completed', documentName: doc.name, documentIndex: docIndex,
+        data, tokenDetails: { input: totalInput, output: totalOutput }
+      });
+      console.log(`[Worker] ✓ ${doc.name} (${docIndex+1}/${totalDocs}) Risk: ${data.risk_rating}`);
+      return { success: true,  docName: doc.name, input: totalInput, output: totalOutput };
+    } else {
+      await putJsonToS3(resultKey, {
+        status: 'failed', documentName: doc.name, documentIndex: docIndex,
+        reason: 'Zero confidence or no data', data: data || null
+      });
+      console.log(`[Worker] ⚠️ Manual review: ${doc.name}`);
+      return { success: false, docName: doc.name, input: totalInput, output: totalOutput };
+    }
+  } catch (err) {
+    console.error(`[Worker] ❌ ${doc.name}:`, err.message);
+    try {
+      await putJsonToS3(`jobs/${jobId}/processing/results/${docIndex}.json`, {
+        status: 'failed', documentName: doc.name, documentIndex: docIndex, reason: err.message
+      });
+    } catch {}
+    return { success: false, docName: doc.name, input: 0, output: 0 };
+  }
+}
+
+/* ────────────────────────────────────────────────
+   SLIDING CONCURRENCY POOL
+   50 slots always busy — next doc starts the moment
+   any slot finishes. No batches, no fixed delays.
+   ──────────────────────────────────────────────── */
+async function runWithConcurrency(tasks, concurrency, onComplete) {
+  let idx = 0;
+  const results = new Array(tasks.length);
+
+  async function runNext() {
+    if (idx >= tasks.length) return;
+    const i  = idx++;
+    results[i] = await tasks[i]();
+    if (onComplete) onComplete(results.filter(Boolean).length, tasks.length, results[i]);
+    await runNext();
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, runNext));
+  return results;
+}
+
+/* ────────────────────────────────────────────────
+   JOB PROCESSOR
+   ──────────────────────────────────────────────── */
 async function processJob(job) {
   const { jobId, type } = job.data;
-  console.log(`[Worker] Processing job: ${job.id}, type: ${type}, jobId: ${jobId}`);
+  console.log(`[Worker] Job ${job.id} | type: ${type} | jobId: ${jobId}`);
   try {
     switch (type) {
-      case 'extract': await processExtraction(jobId, job); break;
-      case 'analyze': await processAnalysis(jobId, job); break;
+      case 'extract':         await processExtraction(jobId, job);       break;
+      case 'analyze':         await processAnalysis(jobId, job);         break;
       case 'generate-report': await processReportGeneration(jobId, job); break;
       default: throw new Error(`Unknown job type: ${type}`);
     }
-  } catch (error) {
-    console.error(`[Worker] Job ${job.id} failed:`, error);
-    broadcastToJob(jobId, 'error', { message: error.message });
-    throw error;
+  } catch (err) {
+    console.error(`[Worker] Job ${job.id} failed:`, err);
+    broadcastToJob(jobId, 'error', { message: err.message });
+    throw err;
   }
 }
 
-/* ------------------------------------------------ */
-/* EXTRACTION (unchanged)                            */
-/* ------------------------------------------------ */
-
+/* ────────────────────────────────────────────────
+   EXTRACTION  (unchanged)
+   ──────────────────────────────────────────────── */
 async function processExtraction(jobId, job) {
-  const timestamp = () => new Date().toISOString().split('T')[1].split('.')[0];
+  const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
 
-  await saveJobLog(jobId, timestamp(), 'Starting ZIP extraction (streaming mode)...');
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: 'Starting ZIP extraction (streaming mode)...' });
+  await saveJobLog(jobId, ts(), 'Starting ZIP extraction...');
+  broadcastToJob(jobId, 'log', { time: ts(), message: 'Starting ZIP extraction...' });
 
-  const supportedExtensions = ['.pdf', '.png', '.jpg', '.jpeg', '.docx'];
+  const supported = ['.pdf', '.png', '.jpg', '.jpeg', '.docx'];
   const documents = [];
-  let extractedCount = 0;
-  let skippedCount = 0;
+  let extracted   = 0;
 
   try {
-    const zipKey = `jobs/${jobId}/uploads/raw/documents.zip`;
-    const zipStream = await getFromS3(zipKey);
-
-    await saveJobLog(jobId, timestamp(), 'Connected to ZIP file, starting streaming extraction...');
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: 'Connected to ZIP file, starting streaming extraction...' });
-
+    const zipStream = await getFromS3(`jobs/${jobId}/uploads/raw/documents.zip`);
+    broadcastToJob(jobId, 'log', { time: ts(), message: 'Connected to ZIP, streaming...' });
     if (job.updateProgress) await job.updateProgress(5);
 
     const zip = zipStream.pipe(unzipper.Parse({ forceStream: true }));
 
     for await (const entry of zip) {
-      const filePath = entry.path;
-      const fileName = filePath.split('/').pop().split('\\').pop();
-      const type = entry.type;
-
-      if (type === 'Directory') { entry.autodrain(); skippedCount++; continue; }
-      if (!fileName || fileName.startsWith('.') || fileName.startsWith('__') || fileName === 'Thumbs.db') { entry.autodrain(); skippedCount++; continue; }
-
-      const ext = fileName.toLowerCase().substring(fileName.lastIndexOf('.'));
-      if (!supportedExtensions.includes(ext)) { entry.autodrain(); skippedCount++; continue; }
+      const name = entry.path.split('/').pop().split('\\').pop();
+      if (entry.type === 'Directory' || !name ||
+          name.startsWith('.') || name.startsWith('__') || name === 'Thumbs.db') {
+        entry.autodrain(); continue;
+      }
+      const ext = name.toLowerCase().substring(name.lastIndexOf('.'));
+      if (!supported.includes(ext)) { entry.autodrain(); continue; }
 
       try {
-        const chunks = [];
-        for await (const chunk of entry) chunks.push(chunk);
-        const content = Buffer.concat(chunks);
-        const fileSizeMB = (content.length / 1024 / 1024).toFixed(2);
-
-        const extractedKey = `jobs/${jobId}/uploads/extracted/${fileName}`;
-        await uploadToS3(extractedKey, content);
-
-        documents.push({ name: fileName, key: extractedKey, type: ext, size: content.length, status: 'pending' });
-        extractedCount++;
-
-        if (extractedCount % 50 === 0 || extractedCount <= 5) {
-          const logMsg = `Extracted ${extractedCount} documents (${fileName}, ${fileSizeMB}MB)...`;
-          await saveJobLog(jobId, timestamp(), logMsg);
-          broadcastToJob(jobId, 'log', { time: timestamp(), message: logMsg });
-          if (job.updateProgress) await job.updateProgress(Math.min(5 + Math.floor(extractedCount / 10), 55));
+        const bufs = []; for await (const c of entry) bufs.push(c);
+        const content = Buffer.concat(bufs);
+        const key     = `jobs/${jobId}/uploads/extracted/${name}`;
+        await uploadToS3(key, content);
+        documents.push({ name, key, type: ext, size: content.length, status: 'pending' });
+        extracted++;
+        if (extracted % 50 === 0 || extracted <= 5) {
+          const msg = `Extracted ${extracted} docs (${name}, ${(content.length/1024/1024).toFixed(2)}MB)...`;
+          await saveJobLog(jobId, ts(), msg);
+          broadcastToJob(jobId, 'log', { time: ts(), message: msg });
         }
-
-        chunks.length = 0;
-      } catch (fileErr) {
-        console.error(`[Extract] Failed to process ${fileName}:`, fileErr.message);
-        skippedCount++;
-      }
+        bufs.length = 0;
+      } catch (e) { console.error(`[Extract] ${name}:`, e.message); }
     }
 
-    const completeMsg = `✓ Extraction complete. ${documents.length} documents found.`;
-    await saveJobLog(jobId, timestamp(), completeMsg);
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: completeMsg });
+    const doneMsg = `✓ Extraction complete. ${documents.length} documents found.`;
+    await saveJobLog(jobId, ts(), doneMsg);
+    broadcastToJob(jobId, 'log', { time: ts(), message: doneMsg });
 
-    const queueData = {
-      totalDocuments: documents.length,
-      processedCount: 0,
-      documents,
-      results: [],
-      failedDocuments: [],
-      status: 'ready'
-    };
+    await putJsonToS3(`jobs/${jobId}/processing/queue.json`, {
+      totalDocuments: documents.length, processedCount: 0,
+      documents, results: [], failedDocuments: [], status: 'ready'
+    });
 
-    await putJsonToS3(`jobs/${jobId}/processing/queue.json`, queueData);
     if (job.updateProgress) await job.updateProgress(60);
-
     updateJobStatus(jobId, { status: 'extracted', totalDocuments: documents.length, processedCount: 0 });
     broadcastToJob(jobId, 'extraction-complete', { totalDocuments: documents.length });
+    broadcastToJob(jobId, 'log', { time: ts(), message: 'Auto-starting document analysis...' });
 
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: 'Auto-starting document analysis...' });
     await processAnalysis(jobId, job);
-
-  } catch (error) {
-    console.error(`[Extract] FATAL ERROR:`, error);
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: `❌ Extraction failed: ${error.message}` });
-    throw error;
+  } catch (err) {
+    console.error('[Extract] FATAL:', err);
+    broadcastToJob(jobId, 'log', { time: ts(), message: `❌ Extraction failed: ${err.message}` });
+    throw err;
   }
 }
 
-/* ------------------------------------------------ */
-/* ANALYSIS - LAMBDA WITH RATE LIMIT PROTECTION     */
-/* ------------------------------------------------ */
-
-async function invokeLambdaWithRetry(jobId, document, documentIndex, totalDocuments, maxRetries = 3) {
-  const payload = JSON.stringify({ jobId, document, documentIndex, totalDocuments });
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const command = new InvokeCommand({
-        FunctionName: LAMBDA_FUNCTION_NAME,
-        InvocationType: 'RequestResponse',
-        Payload: Buffer.from(payload)
-      });
-
-      const response = await lambdaClient.send(command);
-      const responsePayload = JSON.parse(Buffer.from(response.Payload).toString());
-
-      // Check if Bedrock throttled inside Lambda
-      if (response.FunctionError) {
-        const errMsg = JSON.stringify(responsePayload);
-        const isThrottle = errMsg.includes('ThrottlingException') ||
-                           errMsg.includes('Rate exceeded') ||
-                           errMsg.includes('Too Many Requests');
-
-        if (isThrottle && attempt < maxRetries) {
-          const waitMs = 15000 * attempt; // 15s, 30s
-          console.warn(`[Worker] Bedrock throttle on ${document.name}, waiting ${waitMs}ms before retry ${attempt + 1}/${maxRetries}`);
-          await new Promise(r => setTimeout(r, waitMs));
-          continue;
-        }
-
-        console.error(`[Worker] Lambda error for ${document.name}:`, errMsg);
-      } else {
-        console.log(`[Worker] Lambda completed: ${document.name} (${documentIndex + 1}/${totalDocuments})`);
-      }
-
-      return responsePayload;
-
-    } catch (error) {
-      if (attempt < maxRetries) {
-        const waitMs = 10000 * attempt;
-        console.warn(`[Worker] Lambda invoke failed for ${document.name}, retry ${attempt + 1}/${maxRetries} in ${waitMs}ms:`, error.message);
-        await new Promise(r => setTimeout(r, waitMs));
-      } else {
-        console.error(`[Worker] Lambda failed after ${maxRetries} attempts for ${document.name}:`, error.message);
-        throw error;
-      }
-    }
-  }
-}
-
-async function waitForResults(jobId, totalDocuments) {
-  const timestamp = () => new Date().toISOString().split('T')[1].split('.')[0];
-  let lastCompleted = 0;
-
-  console.log(`[Worker] Waiting for ${totalDocuments} Lambda results...`);
-
-  while (true) {
-    let completedCount = 0;
-    try {
-      const objects = await listS3Objects(`jobs/${jobId}/processing/results/`);
-      completedCount = objects.length;
-    } catch {
-      completedCount = 0;
-    }
-
-    if (completedCount > lastCompleted) {
-      const message = `[${completedCount}/${totalDocuments}] Documents processed by Lambda...`;
-      await saveJobLog(jobId, timestamp(), message);
-      broadcastToJob(jobId, 'log', { time: timestamp(), message });
-      broadcastToJob(jobId, 'progress', {
-        current: completedCount,
-        total: totalDocuments,
-        percentage: Math.round((completedCount / totalDocuments) * 100)
-      });
-      lastCompleted = completedCount;
-    }
-
-    if (completedCount >= totalDocuments) {
-      console.log(`[Worker] All ${totalDocuments} Lambda results received!`);
-      break;
-    }
-
-    await new Promise(r => setTimeout(r, POLL_INTERVAL));
-  }
-}
-
-async function collectResults(jobId, documents) {
-  const results = [];
-  const failedDocuments = [];
-  let totalInput = 0;
-  let totalOutput = 0;
-
-  for (let i = 0; i < documents.length; i++) {
-    try {
-      const resultData = await getJsonFromS3(`jobs/${jobId}/processing/results/${i}.json`);
-
-      if (resultData.status === 'completed' && resultData.data) {
-        results.push(resultData.data);
-        totalInput += resultData.tokenDetails?.input || 0;
-        totalOutput += resultData.tokenDetails?.output || 0;
-      } else {
-        failedDocuments.push({
-          name: resultData.documentName || documents[i].name,
-          reason: resultData.reason || 'Processing failed'
-        });
-        if (resultData.data) results.push(resultData.data);
-      }
-    } catch {
-      failedDocuments.push({ name: documents[i].name, reason: 'Result file missing' });
-    }
-  }
-
-  return { results, failedDocuments, totalInput, totalOutput };
-}
-
+/* ────────────────────────────────────────────────
+   ANALYSIS — direct Bedrock, 50 concurrent
+   Auto-skips already-completed docs on resume.
+   ──────────────────────────────────────────────── */
 async function processAnalysis(jobId, job) {
-  const timestamp = () => new Date().toISOString().split('T')[1].split('.')[0];
+  const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
 
-  let queueData = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
-  const pendingDocs = queueData.documents.filter(d => d.status === 'pending');
+  const queueData   = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
+  // ── On resume: process ALL docs (skipping already-done ones via checkpoint) ──
+  const allDocs     = queueData.documents;
+  const pendingDocs = allDocs.filter(d => d.status === 'pending');
 
   if (pendingDocs.length === 0) {
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: 'No pending documents to process.' });
+    broadcastToJob(jobId, 'log', { time: ts(), message: 'No pending documents — generating report.' });
+    await processReportGeneration(jobId, job);
     return;
   }
 
-  const totalBatches = Math.ceil(pendingDocs.length / LAMBDA_BATCH_SIZE);
-  const startMsg = `Starting parallel Lambda analysis of ${pendingDocs.length} documents in ${totalBatches} batches of ${LAMBDA_BATCH_SIZE}...`;
-  await saveJobLog(jobId, timestamp(), startMsg);
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: startMsg });
+  const systemPrompt = await getSystemPrompt();
+
+  // Count how many are already done via S3 checkpoints
+  let alreadyDone = 0;
+  for (let i = 0; i < pendingDocs.length; i++) {
+    if (await isDocAlreadyDone(jobId, i)) alreadyDone++;
+  }
+
+  const startMsg = alreadyDone > 0
+    ? `↩ Resuming — ${alreadyDone} already done, ${pendingDocs.length - alreadyDone} remaining. ${CONCURRENCY} concurrent.`
+    : `🚀 Direct Bedrock — ${pendingDocs.length} docs, ${CONCURRENCY} concurrent, no Lambda`;
+
+  await saveJobLog(jobId, ts(), startMsg);
+  broadcastToJob(jobId, 'log', { time: ts(), message: startMsg });
   updateJobStatus(jobId, { status: 'processing' });
 
-  // ── Fire Lambdas in small batches with a delay between each ──
-  for (let batchStart = 0; batchStart < pendingDocs.length; batchStart += LAMBDA_BATCH_SIZE) {
-    const batch = pendingDocs.slice(batchStart, batchStart + LAMBDA_BATCH_SIZE);
-    const batchEnd = Math.min(batchStart + LAMBDA_BATCH_SIZE, pendingDocs.length);
-    const batchNum = Math.floor(batchStart / LAMBDA_BATCH_SIZE) + 1;
+  let successCount = 0, failCount = 0, totalInput = 0, totalOutput = 0;
 
-    const batchMsg = `Invoking Lambda batch ${batchNum}/${totalBatches} — docs ${batchStart + 1}–${batchEnd} of ${pendingDocs.length}`;
-    await saveJobLog(jobId, timestamp(), batchMsg);
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: batchMsg });
+  const tasks = pendingDocs.map((doc, idx) => async () =>
+    processOneDocument(jobId, doc, idx, pendingDocs.length, systemPrompt)
+  );
 
-    // Invoke this batch in parallel — each with built-in retry on throttle
-    const invokePromises = batch.map((doc, idx) =>
-      invokeLambdaWithRetry(jobId, doc, batchStart + idx, pendingDocs.length)
-    );
+  await runWithConcurrency(tasks, CONCURRENCY, (done, total, result) => {
+    if (result?.success) successCount++; else failCount++;
+    totalInput  += result?.input  || 0;
+    totalOutput += result?.output || 0;
 
-    // Wait for ALL invocations in this batch before moving to the next
-    const batchResults = await Promise.allSettled(invokePromises);
+    broadcastToJob(jobId, 'progress', {
+      current: done, total,
+      percentage: Math.round((done / total) * 100)
+    });
 
-    const batchFailed = batchResults.filter(r => r.status === 'rejected').length;
-    const invokedMsg = batchFailed > 0
-      ? `⚠️ Batch ${batchNum} done — ${batch.length - batchFailed} succeeded, ${batchFailed} failed`
-      : `✓ Batch ${batchNum}/${totalBatches} complete (${batch.length} docs)`;
+    if (done % 10 === 0 || done === total) {
+      const msg = `[${done}/${total}] ${successCount} processed, ${failCount} flagged`;
+      saveJobLog(jobId, ts(), msg).catch(() => {});
+      broadcastToJob(jobId, 'log', { time: ts(), message: msg });
+    }
+  });
 
-    await saveJobLog(jobId, timestamp(), invokedMsg, batchFailed > 0 ? 'warning' : 'success');
-    broadcastToJob(jobId, 'log', { time: timestamp(), message: invokedMsg });
-
-    // ── RATE LIMIT GUARD: pause between batches so Bedrock doesn't throttle ──
-    if (batchEnd < pendingDocs.length) {
-      const delayMsg = `Pausing ${BATCH_DELAY_MS / 1000}s before next batch to avoid Bedrock rate limits...`;
-      await saveJobLog(jobId, timestamp(), delayMsg);
-      broadcastToJob(jobId, 'log', { time: timestamp(), message: delayMsg });
-      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+  // Collect all results from S3 checkpoints
+  const results = [], failedDocuments = [];
+  for (let i = 0; i < pendingDocs.length; i++) {
+    try {
+      const r = await getJsonFromS3(`jobs/${jobId}/processing/results/${i}.json`);
+      if (r.status === 'completed' && r.data) {
+        results.push(r.data);
+      } else {
+        failedDocuments.push({ name: r.documentName || pendingDocs[i].name, reason: r.reason || 'Failed' });
+        if (r.data) results.push(r.data);
+      }
+    } catch {
+      failedDocuments.push({ name: pendingDocs[i].name, reason: 'Result missing' });
     }
   }
 
-  const waitMsg = `All Lambda batches fired! Waiting for all ${pendingDocs.length} results...`;
-  await saveJobLog(jobId, timestamp(), waitMsg);
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: waitMsg });
-
-  await waitForResults(jobId, pendingDocs.length);
-
-  const { results, failedDocuments, totalInput, totalOutput } = await collectResults(jobId, pendingDocs);
-
-  queueData.results = results;
-  queueData.failedDocuments = failedDocuments;
-  queueData.processedCount = pendingDocs.length;
-  queueData.totalTokensInput = totalInput;
+  queueData.results           = results;
+  queueData.failedDocuments   = failedDocuments;
+  queueData.processedCount    = pendingDocs.length;
+  queueData.totalTokensInput  = totalInput;
   queueData.totalTokensOutput = totalOutput;
-  queueData.status = 'analysis-complete';
-
-  queueData.documents = queueData.documents.map(doc => ({
+  queueData.status            = 'analysis-complete';
+  queueData.documents         = allDocs.map(doc => ({
     ...doc,
     status: failedDocuments.find(f => f.name === doc.name) ? 'failed' : 'completed'
   }));
 
   await putJsonToS3(`jobs/${jobId}/processing/queue.json`, queueData);
 
-  const totalTokens = totalInput + totalOutput;
-  const completeMsg = `✓ Analysis complete. ${results.length} processed, ${failedDocuments.length} flagged for review.`;
-  const tokenMsg = `📊 Total tokens used: ${totalTokens.toLocaleString()} (${totalInput.toLocaleString()}↓ ${totalOutput.toLocaleString()}↑)`;
+  const totalTok   = totalInput + totalOutput;
+  const doneMsg    = `✓ Analysis complete. ${results.length} processed, ${failedDocuments.length} flagged.`;
+  const tokenMsg   = `📊 Tokens: ${totalTok.toLocaleString()} (${totalInput.toLocaleString()}↓ ${totalOutput.toLocaleString()}↑)`;
 
-  await saveJobLog(jobId, timestamp(), completeMsg, 'success');
-  await saveJobLog(jobId, timestamp(), tokenMsg, 'info');
+  await saveJobLog(jobId, ts(), doneMsg, 'success');
+  await saveJobLog(jobId, ts(), tokenMsg, 'info');
   await finalizeJobLogs(jobId);
 
   updateJobStatus(jobId, {
-    status: 'analysis-complete',
-    processedCount: queueData.processedCount,
-    failedCount: failedDocuments.length,
-    totalTokensInput: totalInput,
-    totalTokensOutput: totalOutput
+    status: 'analysis-complete', processedCount: queueData.processedCount,
+    failedCount: failedDocuments.length, totalTokensInput: totalInput, totalTokensOutput: totalOutput
   });
 
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: completeMsg });
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: tokenMsg });
+  broadcastToJob(jobId, 'log', { time: ts(), message: doneMsg });
+  broadcastToJob(jobId, 'log', { time: ts(), message: tokenMsg });
   broadcastToJob(jobId, 'analysis-complete', {
-    processed: results.length,
-    failed: failedDocuments.length,
-    totalTokensInput: totalInput,
-    totalTokensOutput: totalOutput
+    processed: results.length, failed: failedDocuments.length,
+    totalTokensInput: totalInput, totalTokensOutput: totalOutput
   });
 
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: 'Auto-starting report generation...' });
+  broadcastToJob(jobId, 'log', { time: ts(), message: 'Auto-starting report generation...' });
   await processReportGeneration(jobId, job);
 }
 
-/* ------------------------------------------------ */
-/* REPORT GENERATION (unchanged)                     */
-/* ------------------------------------------------ */
-
+/* ────────────────────────────────────────────────
+   REPORT GENERATION  (unchanged)
+   ──────────────────────────────────────────────── */
 async function processReportGeneration(jobId, job) {
-  const timestamp = () => new Date().toISOString().split('T')[1].split('.')[0];
+  const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
 
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: 'Generating Excel report...' });
+  broadcastToJob(jobId, 'log', { time: ts(), message: 'Generating Excel report...' });
   updateJobStatus(jobId, { status: 'generating-report' });
 
-  const queueData = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
-
-  const reportKey = await generateAuditReport(jobId, queueData.results, queueData.failedDocuments);
-
+  const queueData   = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
+  const reportKey   = await generateAuditReport(jobId, queueData.results, queueData.failedDocuments);
   const completedAt = new Date().toISOString();
 
-  queueData.status = 'completed';
-  queueData.reportKey = reportKey;
-  queueData.completedAt = completedAt;
+  Object.assign(queueData, { status: 'completed', reportKey, completedAt });
   await putJsonToS3(`jobs/${jobId}/processing/queue.json`, queueData);
 
   try {
-    const metadata = await getJsonFromS3(`jobs/${jobId}/metadata.json`);
-    metadata.status = 'completed';
-    metadata.completedAt = completedAt;
-    metadata.reportKey = reportKey;
-    await putJsonToS3(`jobs/${jobId}/metadata.json`, metadata);
-  } catch (err) {
-    console.error('[Report] Failed to update metadata:', err.message);
-  }
+    const meta = await getJsonFromS3(`jobs/${jobId}/metadata.json`);
+    Object.assign(meta, { status: 'completed', completedAt, reportKey });
+    await putJsonToS3(`jobs/${jobId}/metadata.json`, meta);
+  } catch (e) { console.error('[Report] metadata update failed:', e.message); }
 
   updateJobStatus(jobId, { status: 'completed', reportKey, completedAt });
 
-  await saveJobLog(jobId, timestamp(), '✓ Report generated successfully!', 'success');
-  await saveJobLog(jobId, timestamp(), '✓ All processing complete!', 'success');
+  await saveJobLog(jobId, ts(), '✓ Report generated!', 'success');
+  await saveJobLog(jobId, ts(), '✓ All processing complete!', 'success');
   await finalizeJobLogs(jobId);
 
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: '✓ Report generated successfully!' });
-  broadcastToJob(jobId, 'log', { time: timestamp(), message: '✓ All processing complete!' });
+  broadcastToJob(jobId, 'log',      { time: ts(), message: '✓ Report generated!' });
+  broadcastToJob(jobId, 'log',      { time: ts(), message: '✓ All processing complete!' });
   broadcastToJob(jobId, 'complete', {
-    reportKey,
-    completedAt,
+    reportKey, completedAt,
     stats: {
-      total: queueData.results.length,
-      high: queueData.results.filter(r => r.risk_rating === 'High').length,
-      medium: queueData.results.filter(r => r.risk_rating === 'Medium').length,
-      low: queueData.results.filter(r => r.risk_rating === 'Low').length,
+      total:        queueData.results.length,
+      high:         queueData.results.filter(r => r.risk_rating === 'High').length,
+      medium:       queueData.results.filter(r => r.risk_rating === 'Medium').length,
+      low:          queueData.results.filter(r => r.risk_rating === 'Low').length,
       manualReview: queueData.failedDocuments.length
     }
   });
 }
 
-/* ------------------------------------------------ */
-/* WORKER INITIALIZATION                             */
-/* ------------------------------------------------ */
-
+/* ────────────────────────────────────────────────
+   WORKER INIT
+   ──────────────────────────────────────────────── */
 export async function initializeWorker() {
   registerJobHandler('document-processing', processJob);
 
-  if (isUsingInMemoryQueue()) {
-    console.log('✓ Using in-memory job processing');
-    return null;
-  }
+  if (isUsingInMemoryQueue()) { console.log('✓ In-memory queue'); return null; }
 
-  const workerConnection = getWorkerConnection();
-
-  if (!workerConnection) {
-    console.log('✓ Using in-memory job processing (no worker connection)');
-    return null;
-  }
+  const conn = getWorkerConnection();
+  if (!conn) { console.log('✓ In-memory queue (no Redis)'); return null; }
 
   try {
-    await new Promise((resolve, reject) => {
-      if (workerConnection.status === 'ready') { resolve(); return; }
-      const timeout = setTimeout(() => reject(new Error('Worker connection timeout')), 15000);
-      workerConnection.once('ready', () => { clearTimeout(timeout); resolve(); });
-      workerConnection.once('error', (err) => { clearTimeout(timeout); reject(err); });
+    await new Promise((res, rej) => {
+      if (conn.status === 'ready') { res(); return; }
+      const t = setTimeout(() => rej(new Error('timeout')), 15000);
+      conn.once('ready', () => { clearTimeout(t); res(); });
+      conn.once('error', e  => { clearTimeout(t); rej(e); });
     });
-
-    console.log('✓ Redis worker connection ready');
 
     worker = new Worker('document-processing', processJob, {
-      connection: workerConnection,
-      concurrency: 1,
-      lockDuration: 1800000,
-      stalledInterval: 600000,
-      maxStalledCount: 5,
-      lockRenewTime: 300000,
+      connection: conn, concurrency: 1,
+      lockDuration: 1800000, stalledInterval: 600000,
+      maxStalledCount: 5,    lockRenewTime:   300000
     });
 
-    worker.on('completed', (job) => console.log(`[Worker] Job ${job.id} completed successfully`));
-    worker.on('failed', (job, err) => console.error(`[Worker] Job ${job?.id} failed:`, err.message));
-    worker.on('stalled', (jobId) => console.warn(`[Worker] Job ${jobId} stalled - will retry`));
-    worker.on('error', (err) => console.error(`[Worker] Worker error:`, err.message));
+    worker.on('completed', j     => console.log(`[Worker] ✓ Job ${j.id}`));
+    worker.on('failed',    (j,e) => console.error(`[Worker] ✗ Job ${j?.id}:`, e.message));
+    worker.on('stalled',   id    => console.warn(`[Worker] ⚠ Job ${id} stalled`));
+    worker.on('error',     e     => console.error(`[Worker] Error:`, e.message));
 
-    console.log(`✓ BullMQ worker initialized — batch size: ${LAMBDA_BATCH_SIZE}, batch delay: ${BATCH_DELAY_MS}ms`);
+    console.log(`✓ Worker ready — direct Bedrock, ${CONCURRENCY} concurrent, checkpoint per doc`);
     return worker;
-
   } catch (err) {
-    console.warn('⚠️  BullMQ worker failed to initialize:', err.message);
+    console.warn('⚠️  Worker init failed:', err.message);
     return null;
   }
 }
 
 export { worker };
 
-console.log('[Worker] Starting worker process...');
+console.log('[Worker] Starting...');
 initializeWorker()
-  .then(() => console.log('[Worker] Worker started successfully - waiting for jobs'))
-  .catch((err) => { console.error('[Worker] Failed to start:', err); process.exit(1); });
+  .then(() => console.log('[Worker] Ready'))
+  .catch(e  => { console.error('[Worker] Fatal:', e); process.exit(1); });
 
-process.on('SIGTERM', () => { console.log('[Worker] Received SIGTERM, shutting down gracefully...'); process.exit(0); });
-process.on('SIGINT', () => { console.log('[Worker] Received SIGINT, shutting down gracefully...'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('[Worker] SIGTERM'); process.exit(0); });
+process.on('SIGINT',  () => { console.log('[Worker] SIGINT');  process.exit(0); });
 setInterval(() => {}, 1000 * 60 * 60);
