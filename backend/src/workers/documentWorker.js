@@ -13,14 +13,25 @@ import { generateAuditReport } from '../services/excelService.js';
 /* ────────────────────────────────────────────────
    CONFIG
    ──────────────────────────────────────────────── */
-const CONCURRENCY     = 50;               // simultaneous Bedrock calls
-const MAX_DIRECT_SIZE = 10 * 1024 * 1024; // 10 MB → send PDF directly
+const CONCURRENCY     = 50;
+const MAX_DIRECT_SIZE = 10 * 1024 * 1024; // 10MB → send PDF directly
 const TEXT_CHUNK_SIZE = 40000;
 const MAX_PAGES_BATCH = 5;
 const REGION          = process.env.AWS_REGION || 'ap-south-1';
 
 const bedrockClient = new BedrockRuntimeClient({ region: REGION });
 let worker = null;
+
+/* ────────────────────────────────────────────────
+   STREAM → BUFFER HELPER
+   s3Service.getFromS3 returns a stream.
+   All PDF/image processing needs a Buffer.
+   ──────────────────────────────────────────────── */
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
 /* ────────────────────────────────────────────────
    LOG HELPERS
@@ -50,10 +61,9 @@ async function flushJobLogs(jobId) {
 const finalizeJobLogs = (jobId) => flushJobLogs(jobId);
 
 /* ────────────────────────────────────────────────
-   CHECKPOINT HELPERS
-   Every completed/failed doc is written immediately
-   to jobs/{jobId}/processing/results/{idx}.json
-   so a worker restart can skip already-done docs.
+   CHECKPOINT HELPER
+   Every doc writes its result to S3 immediately.
+   On resume, already-done docs are skipped.
    ──────────────────────────────────────────────── */
 async function isDocAlreadyDone(jobId, docIndex) {
   try {
@@ -63,53 +73,37 @@ async function isDocAlreadyDone(jobId, docIndex) {
 }
 
 /* ────────────────────────────────────────────────
-   SYSTEM PROMPT — from S3 masters
+   SYSTEM PROMPT
    ──────────────────────────────────────────────── */
 async function getSystemPrompt() {
+  const basePrompt = `Analyze this legal document and extract structured information.
+Return ONLY a valid JSON object with these exact fields:
+{
+  "appl_no":"string","borrower_name":"string","property_address":"string",
+  "property_type":"string","state":"string","tsr_date":"string",
+  "ownership_title_chain_status":"string","encumbrances_adverse_entries":"string",
+  "subsequent_charges":"string","prior_charge_subsisting":"string",
+  "roc_charge_flag":"string","litigation_lis_pendens":"string",
+  "mutation_status":"string","revenue_municipal_dues":"string",
+  "land_use_zoning_status":"string","stamping_registration_issues":"string",
+  "mortgage_perfection_issues":"string","advocate_adverse_remarks":"string",
+  "risk_rating":"High|Medium|Low","enforceability_decision":"string",
+  "enforceability_rationale":"string","recommended_actions":"string",
+  "confidence_score":0.0
+}
+No markdown. No explanation. Just JSON.`;
+
   try {
-    const buf     = await getFromS3('masters/legal_audit_prompt.json');
+    const buf     = await streamToBuffer(await getFromS3('masters/legal_audit_prompt.json'));
     const masters = JSON.parse(buf.toString());
-    return `You are a legal document audit assistant for a bank/NBFC.
-${masters.systemRole || ''}
-Analyze this legal document and extract structured information.
-Return ONLY a valid JSON object with these exact fields:
-{
-  "appl_no":"string","borrower_name":"string","property_address":"string",
-  "property_type":"string","state":"string","tsr_date":"string",
-  "ownership_title_chain_status":"string","encumbrances_adverse_entries":"string",
-  "subsequent_charges":"string","prior_charge_subsisting":"string",
-  "roc_charge_flag":"string","litigation_lis_pendens":"string",
-  "mutation_status":"string","revenue_municipal_dues":"string",
-  "land_use_zoning_status":"string","stamping_registration_issues":"string",
-  "mortgage_perfection_issues":"string","advocate_adverse_remarks":"string",
-  "risk_rating":"High|Medium|Low","enforceability_decision":"string",
-  "enforceability_rationale":"string","recommended_actions":"string",
-  "confidence_score":0.0
-}
-No markdown. No explanation. Just JSON.`;
+    return `You are a legal document audit assistant for a bank/NBFC.\n${masters.systemRole || ''}\n${basePrompt}`;
   } catch {
-    return `You are a legal document audit assistant for a bank/NBFC.
-Analyze this legal document and extract structured information.
-Return ONLY a valid JSON object with these exact fields:
-{
-  "appl_no":"string","borrower_name":"string","property_address":"string",
-  "property_type":"string","state":"string","tsr_date":"string",
-  "ownership_title_chain_status":"string","encumbrances_adverse_entries":"string",
-  "subsequent_charges":"string","prior_charge_subsisting":"string",
-  "roc_charge_flag":"string","litigation_lis_pendens":"string",
-  "mutation_status":"string","revenue_municipal_dues":"string",
-  "land_use_zoning_status":"string","stamping_registration_issues":"string",
-  "mortgage_perfection_issues":"string","advocate_adverse_remarks":"string",
-  "risk_rating":"High|Medium|Low","enforceability_decision":"string",
-  "enforceability_rationale":"string","recommended_actions":"string",
-  "confidence_score":0.0
-}
-No markdown. No explanation. Just JSON.`;
+    return `You are a legal document audit assistant for a bank/NBFC.\n${basePrompt}`;
   }
 }
 
 /* ────────────────────────────────────────────────
-   BEDROCK CALL  (with throttle-aware retry)
+   BEDROCK CALL  (throttle-aware retry)
    ──────────────────────────────────────────────── */
 function parseJsonResponse(text) {
   try { return JSON.parse(text); } catch {
@@ -137,7 +131,7 @@ async function callBedrock(content, mediaType, systemPrompt, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const cmd    = new InvokeModelCommand({
+      const cmd = new InvokeModelCommand({
         modelId: 'global.anthropic.claude-sonnet-4-6',
         contentType: 'application/json', accept: 'application/json',
         body: JSON.stringify({
@@ -167,22 +161,28 @@ async function callBedrock(content, mediaType, systemPrompt, retries = 3) {
 }
 
 /* ────────────────────────────────────────────────
-   PROCESS ONE DOCUMENT  (identical logic to Lambda)
+   PROCESS ONE DOCUMENT
+   Identical logic to the old Lambda handler.
+   docBuffer MUST be a Buffer (not a stream).
    ──────────────────────────────────────────────── */
 async function processDocument(docBuffer, docType, systemPrompt) {
   let chunks = [], totalInput = 0, totalOutput = 0;
 
   if (docType === '.pdf') {
     if (docBuffer.length <= MAX_DIRECT_SIZE) {
+      // Small PDF — send directly as base64
       const { text, inputTokens, outputTokens } =
         await callBedrock(docBuffer.toString('base64'), 'pdf', systemPrompt);
       totalInput += inputTokens; totalOutput += outputTokens;
       const d = parseJsonResponse(text); if (d) chunks.push(d);
+
     } else {
+      // Large PDF — try text extraction first
       let pdfData; try { pdfData = await pdf(docBuffer); } catch {}
       const hasText = pdfData?.text?.trim().length > 500;
 
       if (hasText) {
+        // Text chunks
         const paragraphs = pdfData.text.split(/\n\s*\n/);
         let cur = ''; const parts = [];
         for (const p of paragraphs) {
@@ -190,33 +190,40 @@ async function processDocument(docBuffer, docType, systemPrompt) {
           else cur += (cur ? '\n\n' : '') + p;
         }
         if (cur.trim()) parts.push(cur.trim());
+
         for (const part of parts) {
           const { text, inputTokens, outputTokens } = await callBedrock(part, 'text', systemPrompt);
           totalInput += inputTokens; totalOutput += outputTokens;
           const d = parseJsonResponse(text); if (d) chunks.push(d);
           await new Promise(r => setTimeout(r, 500));
         }
+
       } else {
-        const pdfDoc  = await PDFDocument.load(docBuffer, { ignoreEncryption: true });
+        // Scanned PDF — page batches
+        const pdfDoc   = await PDFDocument.load(docBuffer, { ignoreEncryption: true });
         const maxPages = Math.min(pdfDoc.getPageCount(), 500);
+
         for (let i = 0; i < maxPages; i += MAX_PAGES_BATCH) {
-          const idx = []; for (let j = i; j < Math.min(i + MAX_PAGES_BATCH, maxPages); j++) idx.push(j);
+          const idx = [];
+          for (let j = i; j < Math.min(i + MAX_PAGES_BATCH, maxPages); j++) idx.push(j);
           const batch = await PDFDocument.create();
           (await batch.copyPages(pdfDoc, idx)).forEach(p => batch.addPage(p));
-          const { text, inputTokens, outputTokens } =
-            await callBedrock(Buffer.from(await batch.save()).toString('base64'), 'pdf', systemPrompt);
+          const base64 = Buffer.from(await batch.save()).toString('base64');
+          const { text, inputTokens, outputTokens } = await callBedrock(base64, 'pdf', systemPrompt);
           totalInput += inputTokens; totalOutput += outputTokens;
           const d = parseJsonResponse(text); if (d) chunks.push(d);
           await new Promise(r => setTimeout(r, 500));
         }
       }
     }
+
   } else if (['.png', '.jpg', '.jpeg'].includes(docType)) {
     const mt = docType === '.png' ? 'image/png' : 'image/jpeg';
     const { text, inputTokens, outputTokens } =
       await callBedrock(docBuffer.toString('base64'), mt, systemPrompt);
     totalInput += inputTokens; totalOutput += outputTokens;
     const d = parseJsonResponse(text); if (d) chunks.push(d);
+
   } else {
     const { text, inputTokens, outputTokens } =
       await callBedrock(docBuffer.toString('utf-8'), 'text', systemPrompt);
@@ -227,7 +234,7 @@ async function processDocument(docBuffer, docType, systemPrompt) {
   if (!chunks.length) return { success: false, data: null, totalInput, totalOutput };
   if (chunks.length === 1) return { success: true, data: chunks[0], totalInput, totalOutput };
 
-  // Merge multiple chunks — worst risk wins
+  // Merge multiple chunks — worst risk rating wins
   const rp = ['High', 'Medium', 'Low', 'Manual Review Required', 'Unknown'];
   const merged = { ...chunks[0] };
   for (let i = 1; i < chunks.length; i++) {
@@ -247,14 +254,14 @@ async function processDocument(docBuffer, docType, systemPrompt) {
 
 /* ────────────────────────────────────────────────
    PROCESS ONE DOC WRAPPER
-   — skips if already done (crash-resume support)
-   — writes result to S3 immediately (checkpoint)
+   — Skips if already done (crash-resume support)
+   — Converts S3 stream → Buffer before processing
+   — Writes checkpoint to S3 immediately on finish
    ──────────────────────────────────────────────── */
 async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt) {
-  // ── CHECKPOINT: skip if this doc was already processed ──
+  // CHECKPOINT: skip already-processed docs on resume
   if (await isDocAlreadyDone(jobId, docIndex)) {
-    console.log(`[Worker] ↩ Skipping already-done doc ${docIndex}: ${doc.name}`);
-    // Re-read the existing result so token counts are preserved
+    console.log(`[Worker] ↩ Skip (already done) ${docIndex}: ${doc.name}`);
     try {
       const existing = await getJsonFromS3(`jobs/${jobId}/processing/results/${docIndex}.json`);
       return {
@@ -268,7 +275,10 @@ async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt)
   }
 
   try {
-    const docBuffer = await getFromS3(doc.key);
+    // ── KEY FIX: convert S3 stream → Buffer ──
+    const docStream = await getFromS3(doc.key);
+    const docBuffer = await streamToBuffer(docStream);
+
     const { success, data, totalInput, totalOutput } =
       await processDocument(docBuffer, doc.type, systemPrompt);
 
@@ -277,7 +287,7 @@ async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt)
     if (success && data && data.confidence_score > 0) {
       data.document_name = doc.name;
       data.processed_at  = new Date().toISOString();
-      // ── CHECKPOINT WRITE — immediately persisted to S3 ──
+      // CHECKPOINT WRITE — immediately saved to S3
       await putJsonToS3(resultKey, {
         status: 'completed', documentName: doc.name, documentIndex: docIndex,
         data, tokenDetails: { input: totalInput, output: totalOutput }
@@ -292,6 +302,7 @@ async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt)
       console.log(`[Worker] ⚠️ Manual review: ${doc.name}`);
       return { success: false, docName: doc.name, input: totalInput, output: totalOutput };
     }
+
   } catch (err) {
     console.error(`[Worker] ❌ ${doc.name}:`, err.message);
     try {
@@ -305,8 +316,9 @@ async function processOneDocument(jobId, doc, docIndex, totalDocs, systemPrompt)
 
 /* ────────────────────────────────────────────────
    SLIDING CONCURRENCY POOL
-   50 slots always busy — next doc starts the moment
-   any slot finishes. No batches, no fixed delays.
+   50 slots always busy.
+   Next doc starts the moment any slot finishes.
+   No batches, no fixed delays.
    ──────────────────────────────────────────────── */
 async function runWithConcurrency(tasks, concurrency, onComplete) {
   let idx = 0;
@@ -314,7 +326,7 @@ async function runWithConcurrency(tasks, concurrency, onComplete) {
 
   async function runNext() {
     if (idx >= tasks.length) return;
-    const i  = idx++;
+    const i    = idx++;
     results[i] = await tasks[i]();
     if (onComplete) onComplete(results.filter(Boolean).length, tasks.length, results[i]);
     await runNext();
@@ -345,7 +357,7 @@ async function processJob(job) {
 }
 
 /* ────────────────────────────────────────────────
-   EXTRACTION  (unchanged)
+   EXTRACTION
    ──────────────────────────────────────────────── */
 async function processExtraction(jobId, job) {
   const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
@@ -355,7 +367,7 @@ async function processExtraction(jobId, job) {
 
   const supported = ['.pdf', '.png', '.jpg', '.jpeg', '.docx'];
   const documents = [];
-  let extracted   = 0;
+  let extracted = 0;
 
   try {
     const zipStream = await getFromS3(`jobs/${jobId}/uploads/raw/documents.zip`);
@@ -404,6 +416,7 @@ async function processExtraction(jobId, job) {
     broadcastToJob(jobId, 'log', { time: ts(), message: 'Auto-starting document analysis...' });
 
     await processAnalysis(jobId, job);
+
   } catch (err) {
     console.error('[Extract] FATAL:', err);
     broadcastToJob(jobId, 'log', { time: ts(), message: `❌ Extraction failed: ${err.message}` });
@@ -413,15 +426,13 @@ async function processExtraction(jobId, job) {
 
 /* ────────────────────────────────────────────────
    ANALYSIS — direct Bedrock, 50 concurrent
-   Auto-skips already-completed docs on resume.
+   On resume: checkpoint skips already-done docs.
    ──────────────────────────────────────────────── */
 async function processAnalysis(jobId, job) {
   const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
 
   const queueData   = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
-  // ── On resume: process ALL docs (skipping already-done ones via checkpoint) ──
-  const allDocs     = queueData.documents;
-  const pendingDocs = allDocs.filter(d => d.status === 'pending');
+  const pendingDocs = queueData.documents.filter(d => d.status === 'pending');
 
   if (pendingDocs.length === 0) {
     broadcastToJob(jobId, 'log', { time: ts(), message: 'No pending documents — generating report.' });
@@ -429,17 +440,19 @@ async function processAnalysis(jobId, job) {
     return;
   }
 
+  // Load prompt ONCE — shared across all 50 concurrent calls
   const systemPrompt = await getSystemPrompt();
 
-  // Count how many are already done via S3 checkpoints
+  // Count already-done via S3 checkpoints (for resume display)
   let alreadyDone = 0;
   for (let i = 0; i < pendingDocs.length; i++) {
     if (await isDocAlreadyDone(jobId, i)) alreadyDone++;
   }
 
-  const startMsg = alreadyDone > 0
-    ? `↩ Resuming — ${alreadyDone} already done, ${pendingDocs.length - alreadyDone} remaining. ${CONCURRENCY} concurrent.`
-    : `🚀 Direct Bedrock — ${pendingDocs.length} docs, ${CONCURRENCY} concurrent, no Lambda`;
+  const remaining = pendingDocs.length - alreadyDone;
+  const startMsg  = alreadyDone > 0
+    ? `↩ Resuming — ${alreadyDone} already done, ${remaining} remaining, ${CONCURRENCY} concurrent`
+    : `🚀 Direct Bedrock — ${pendingDocs.length} docs, ${CONCURRENCY} concurrent`;
 
   await saveJobLog(jobId, ts(), startMsg);
   broadcastToJob(jobId, 'log', { time: ts(), message: startMsg });
@@ -451,6 +464,7 @@ async function processAnalysis(jobId, job) {
     processOneDocument(jobId, doc, idx, pendingDocs.length, systemPrompt)
   );
 
+  // Sliding window — 50 slots, always full
   await runWithConcurrency(tasks, CONCURRENCY, (done, total, result) => {
     if (result?.success) successCount++; else failCount++;
     totalInput  += result?.input  || 0;
@@ -490,16 +504,16 @@ async function processAnalysis(jobId, job) {
   queueData.totalTokensInput  = totalInput;
   queueData.totalTokensOutput = totalOutput;
   queueData.status            = 'analysis-complete';
-  queueData.documents         = allDocs.map(doc => ({
+  queueData.documents         = queueData.documents.map(doc => ({
     ...doc,
     status: failedDocuments.find(f => f.name === doc.name) ? 'failed' : 'completed'
   }));
 
   await putJsonToS3(`jobs/${jobId}/processing/queue.json`, queueData);
 
-  const totalTok   = totalInput + totalOutput;
-  const doneMsg    = `✓ Analysis complete. ${results.length} processed, ${failedDocuments.length} flagged.`;
-  const tokenMsg   = `📊 Tokens: ${totalTok.toLocaleString()} (${totalInput.toLocaleString()}↓ ${totalOutput.toLocaleString()}↑)`;
+  const totalTok  = totalInput + totalOutput;
+  const doneMsg   = `✓ Analysis complete. ${results.length} processed, ${failedDocuments.length} flagged.`;
+  const tokenMsg  = `📊 Tokens: ${totalTok.toLocaleString()} (${totalInput.toLocaleString()}↓ ${totalOutput.toLocaleString()}↑)`;
 
   await saveJobLog(jobId, ts(), doneMsg, 'success');
   await saveJobLog(jobId, ts(), tokenMsg, 'info');
@@ -507,7 +521,8 @@ async function processAnalysis(jobId, job) {
 
   updateJobStatus(jobId, {
     status: 'analysis-complete', processedCount: queueData.processedCount,
-    failedCount: failedDocuments.length, totalTokensInput: totalInput, totalTokensOutput: totalOutput
+    failedCount: failedDocuments.length,
+    totalTokensInput: totalInput, totalTokensOutput: totalOutput
   });
 
   broadcastToJob(jobId, 'log', { time: ts(), message: doneMsg });
@@ -522,7 +537,7 @@ async function processAnalysis(jobId, job) {
 }
 
 /* ────────────────────────────────────────────────
-   REPORT GENERATION  (unchanged)
+   REPORT GENERATION
    ──────────────────────────────────────────────── */
 async function processReportGeneration(jobId, job) {
   const ts = () => new Date().toISOString().split('T')[1].split('.')[0];
@@ -544,7 +559,6 @@ async function processReportGeneration(jobId, job) {
   } catch (e) { console.error('[Report] metadata update failed:', e.message); }
 
   updateJobStatus(jobId, { status: 'completed', reportKey, completedAt });
-
   await saveJobLog(jobId, ts(), '✓ Report generated!', 'success');
   await saveJobLog(jobId, ts(), '✓ All processing complete!', 'success');
   await finalizeJobLogs(jobId);
@@ -568,7 +582,6 @@ async function processReportGeneration(jobId, job) {
    ──────────────────────────────────────────────── */
 export async function initializeWorker() {
   registerJobHandler('document-processing', processJob);
-
   if (isUsingInMemoryQueue()) { console.log('✓ In-memory queue'); return null; }
 
   const conn = getWorkerConnection();

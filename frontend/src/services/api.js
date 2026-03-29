@@ -28,73 +28,64 @@ export const jobsApi = {
   create: (userEmail) => fetchApi('/api/jobs/create', { method: 'POST', body: JSON.stringify({ userEmail }) }),
 
   uploadZip: async (jobId, file, onProgress) => {
-    const PART_SIZE = 10 * 1024 * 1024; // 10MB per part
-    const partCount = Math.ceil(file.size / PART_SIZE);
-
-    // Step 1 — tell backend to initiate multipart upload on S3
-    // Backend returns: uploadId, s3Key, partUrls (one presigned PUT URL per part)
-    const { uploadId, s3Key, partUrls } = await fetchApi(`/api/jobs/${jobId}/presign-upload`, {
+    // Step 1 — get presigned URL from backend (tiny request, instant)
+    const { uploadUrl, s3Key } = await fetchApi(`/api/jobs/${jobId}/presign-upload`, {
       method: 'POST',
-      body: JSON.stringify({
-        fileName: file.name,
-        contentType: file.type || 'application/zip',
-        partCount,
-      })
+      body: JSON.stringify({ fileName: file.name, contentType: file.type || 'application/zip' })
     });
 
-    // Step 2 — upload each 10MB chunk directly to S3 using its presigned URL
-    // If a part fails, it retries up to 3 times before giving up
-    const parts = [];
-    let uploadedBytes = 0;
+    // Step 2 — upload directly to S3 (single PUT, fastest possible)
+    // Retries up to 3 times on network failure — same URL works for 1 hour
+    const MAX_RETRIES = 3;
+    let lastError;
 
-    for (let i = 0; i < partCount; i++) {
-      const start = i * PART_SIZE;
-      const end = Math.min(start + PART_SIZE, file.size);
-      const chunk = file.slice(start, end);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
 
-      let attempts = 0;
-      let etag;
-
-      while (attempts < 3) {
-        try {
-          const res = await fetch(partUrls[i], {
-            method: 'PUT',
-            body: chunk,
-            headers: { 'Content-Type': file.type || 'application/zip' },
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable && onProgress) {
+              onProgress(Math.round((e.loaded / e.total) * 100));
+            }
           });
-          if (!res.ok) throw new Error(`Part ${i + 1} failed with status ${res.status}`);
-          etag = res.headers.get('ETag');
-          break; // success — move to next part
-        } catch (err) {
-          attempts++;
-          if (attempts === 3) {
-            // 3 strikes — abort cleanly so S3 doesn't keep incomplete parts
-            await fetchApi(`/api/jobs/${jobId}/abort-multipart`, {
-              method: 'POST',
-              body: JSON.stringify({ s3Key, uploadId }),
-            }).catch(() => {}); // best-effort abort
-            throw new Error(`Upload failed after 3 attempts on part ${i + 1}: ${err.message}`);
-          }
-          // wait before retry: 2s after 1st fail, 4s after 2nd
-          await new Promise(r => setTimeout(r, 2000 * attempts));
+
+          xhr.addEventListener('load', () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve();
+            else reject(new Error(`S3 upload failed: ${xhr.status}`));
+          });
+
+          xhr.addEventListener('error',   () => reject(new Error('Network error during upload')));
+          xhr.addEventListener('timeout', () => reject(new Error('Upload timed out')));
+
+          xhr.open('PUT', uploadUrl);
+          xhr.setRequestHeader('Content-Type', file.type || 'application/zip');
+          xhr.timeout = 60 * 60 * 1000; // 1 hour — for very large files
+          xhr.send(file);
+        });
+
+        // Success — break retry loop
+        break;
+
+      } catch (err) {
+        lastError = err;
+        console.warn(`[Upload] Attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
+
+        if (attempt < MAX_RETRIES) {
+          const waitMs = 5000 * attempt; // 5s, 10s before retry
+          console.log(`[Upload] Retrying in ${waitMs / 1000}s...`);
+          if (onProgress) onProgress(0); // reset bar so user sees retry
+          await new Promise(r => setTimeout(r, waitMs));
+        } else {
+          throw new Error(`Upload failed after ${MAX_RETRIES} attempts: ${lastError.message}`);
         }
       }
-
-      parts.push({ PartNumber: i + 1, ETag: etag });
-      uploadedBytes += (end - start);
-      if (onProgress) onProgress(Math.round((uploadedBytes / file.size) * 100));
     }
 
-    // Step 3 — tell S3 to assemble all parts into one file
-    await fetchApi(`/api/jobs/${jobId}/complete-multipart`, {
-      method: 'POST',
-      body: JSON.stringify({ s3Key, uploadId, parts }),
-    });
-
-    // Step 4 — tell backend upload is confirmed so it can enqueue the job
+    // Step 3 — confirm to backend → enqueues the job
     return fetchApi(`/api/jobs/${jobId}/confirm-upload`, {
       method: 'POST',
-      body: JSON.stringify({ s3Key, fileName: file.name, fileSize: file.size }),
+      body: JSON.stringify({ s3Key, fileName: file.name, fileSize: file.size })
     });
   },
 
@@ -118,29 +109,29 @@ export const jobsApi = {
     });
   },
 
-  analyzePdf: (jobId) => fetchApi(`/api/jobs/${jobId}/analyze-pdf`),
-  uploadDocuments: async (jobId, files) => { const formData = new FormData(); files.forEach(file => formData.append('files', file)); return fetchApi(`/api/jobs/${jobId}/upload-documents`, { method: 'POST', body: formData }); },
-  startExtraction: (jobId) => fetchApi(`/api/jobs/${jobId}/extract`, { method: 'POST' }),
-  startAnalysis: (jobId) => fetchApi(`/api/jobs/${jobId}/analyze`, { method: 'POST' }),
-  generateReport: (jobId) => fetchApi(`/api/jobs/${jobId}/generate-report`, { method: 'POST' }),
-  getStatus: (jobId) => fetchApi(`/api/jobs/${jobId}/status`),
-  getDownloadUrl: (jobId) => fetchApi(`/api/jobs/${jobId}/download`),
-  getLogs: (jobId) => fetchApi(`/api/jobs/${jobId}/logs`),
-  resumeJob: (jobId) => fetchApi(`/api/jobs/${jobId}/resume`, { method: 'POST' }),
-  list: () => fetchApi('/api/jobs'),
+  analyzePdf:       (jobId)        => fetchApi(`/api/jobs/${jobId}/analyze-pdf`),
+  uploadDocuments:  async (jobId, files) => { const formData = new FormData(); files.forEach(f => formData.append('files', f)); return fetchApi(`/api/jobs/${jobId}/upload-documents`, { method: 'POST', body: formData }); },
+  startExtraction:  (jobId)        => fetchApi(`/api/jobs/${jobId}/extract`,         { method: 'POST' }),
+  startAnalysis:    (jobId)        => fetchApi(`/api/jobs/${jobId}/analyze`,          { method: 'POST' }),
+  generateReport:   (jobId)        => fetchApi(`/api/jobs/${jobId}/generate-report`,  { method: 'POST' }),
+  getStatus:        (jobId)        => fetchApi(`/api/jobs/${jobId}/status`),
+  getDownloadUrl:   (jobId)        => fetchApi(`/api/jobs/${jobId}/download`),
+  getLogs:          (jobId)        => fetchApi(`/api/jobs/${jobId}/logs`),
+  resumeJob:        (jobId)        => fetchApi(`/api/jobs/${jobId}/resume`,           { method: 'POST' }),
+  list:             ()             => fetchApi('/api/jobs'),
 
   subscribeToEvents: (jobId, handlers) => {
     const eventSource = new EventSource(`${API_URL}/api/jobs/${jobId}/events`);
-    eventSource.addEventListener('connected', (e) => handlers.onConnected?.(JSON.parse(e.data)));
-    eventSource.addEventListener('log', (e) => handlers.onLog?.(JSON.parse(e.data)));
-    eventSource.addEventListener('progress', (e) => handlers.onProgress?.(JSON.parse(e.data)));
-    eventSource.addEventListener('processing', (e) => handlers.onProcessing?.(JSON.parse(e.data)));
-    eventSource.addEventListener('chunk-progress', (e) => handlers.onChunkProgress?.(JSON.parse(e.data)));
-    eventSource.addEventListener('tokens', (e) => handlers.onTokens?.(JSON.parse(e.data)));
-    eventSource.addEventListener('extraction-complete', (e) => handlers.onExtractionComplete?.(JSON.parse(e.data)));
-    eventSource.addEventListener('analysis-complete', (e) => handlers.onAnalysisComplete?.(JSON.parse(e.data)));
-    eventSource.addEventListener('complete', (e) => handlers.onComplete?.(JSON.parse(e.data)));
-    eventSource.addEventListener('error', (e) => handlers.onError?.(e));
+    eventSource.addEventListener('connected',          (e) => handlers.onConnected?.(JSON.parse(e.data)));
+    eventSource.addEventListener('log',                (e) => handlers.onLog?.(JSON.parse(e.data)));
+    eventSource.addEventListener('progress',           (e) => handlers.onProgress?.(JSON.parse(e.data)));
+    eventSource.addEventListener('processing',         (e) => handlers.onProcessing?.(JSON.parse(e.data)));
+    eventSource.addEventListener('chunk-progress',     (e) => handlers.onChunkProgress?.(JSON.parse(e.data)));
+    eventSource.addEventListener('tokens',             (e) => handlers.onTokens?.(JSON.parse(e.data)));
+    eventSource.addEventListener('extraction-complete',(e) => handlers.onExtractionComplete?.(JSON.parse(e.data)));
+    eventSource.addEventListener('analysis-complete',  (e) => handlers.onAnalysisComplete?.(JSON.parse(e.data)));
+    eventSource.addEventListener('complete',           (e) => handlers.onComplete?.(JSON.parse(e.data)));
+    eventSource.addEventListener('error',              (e) => handlers.onError?.(e));
     eventSource.onerror = () => handlers.onError?.({ message: 'Connection lost' });
     return () => eventSource.close();
   }
