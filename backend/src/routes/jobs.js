@@ -310,30 +310,53 @@ router.get('/:jobId/download', async (req, res) => {
 // List all jobs
 router.get('/', async (req, res) => {
   try {
-    const objects = await listS3Objects('jobs/');
-    const jobIds  = new Set();
-    objects.forEach(obj => { const m = obj.Key.match(/^jobs\/([^\/]+)\//); if (m) jobIds.add(m[1]); });
+    // List only top-level job folders (not all objects inside them)
+    const { S3Client, ListObjectsV2Command } = await import('@aws-sdk/client-s3');
+    const s3 = new S3Client({ region: process.env.AWS_REGION });
+    const BUCKET = process.env.S3_BUCKET_NAME;
+
+    const allJobIds = new Set();
+    let continuationToken = null;
+
+    do {
+      const response = await s3.send(new ListObjectsV2Command({
+        Bucket: BUCKET,
+        Prefix: 'jobs/',
+        Delimiter: '/',          // ← KEY: only get top-level folders, not all files
+        MaxKeys: 1000,
+        ...(continuationToken && { ContinuationToken: continuationToken })
+      }));
+
+      // CommonPrefixes gives us folder names like "jobs/20260330_.../
+      response.CommonPrefixes?.forEach(p => {
+        const match = p.Prefix.match(/^jobs\/([^\/]+)\/$/);
+        if (match) allJobIds.add(match[1]);
+      });
+
+      continuationToken = response.IsTruncated ? response.NextContinuationToken : null;
+    } while (continuationToken);
+
+    console.log(`[Jobs] Found ${allJobIds.size} job folders`);
 
     const jobs = [];
-    for (const jobId of jobIds) {
+    for (const jobId of allJobIds) {
       try {
         const metadata = await getJsonFromS3(`jobs/${jobId}/metadata.json`);
 
-        // Enrich with queue.json if metadata is missing doc counts
-        if (!metadata.totalDocuments || metadata.totalDocuments === 0) {
-          try {
-            const queue = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
-            metadata.totalDocuments = queue.totalDocuments || 0;
+        // Enrich with queue.json for accurate doc counts
+        try {
+          const queue = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
+          if (queue.totalDocuments > 0) {
+            metadata.totalDocuments = queue.totalDocuments;
             metadata.processedCount = queue.processedCount || 0;
             metadata.failedCount    = queue.failedDocuments?.length || 0;
-            // If queue says completed but metadata doesn't, fix status
-            if (queue.status === 'completed' && metadata.status !== 'completed') {
-              metadata.status      = 'completed';
-              metadata.completedAt = queue.completedAt || metadata.completedAt;
-              metadata.reportKey   = queue.reportKey   || metadata.reportKey;
-            }
-          } catch {}
-        }
+          }
+          if (queue.status === 'completed' && metadata.status !== 'completed') {
+            metadata.status      = 'completed';
+            metadata.completedAt = queue.completedAt || metadata.completedAt;
+            metadata.reportKey   = queue.reportKey   || metadata.reportKey;
+          }
+        } catch {}
 
         jobs.push(metadata);
       } catch {}
@@ -342,6 +365,7 @@ router.get('/', async (req, res) => {
     jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json({ jobs });
   } catch (error) {
+    console.error('List jobs error:', error);
     res.status(500).json({ error: 'Failed to list jobs' });
   }
 });
