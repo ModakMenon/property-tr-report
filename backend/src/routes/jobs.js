@@ -313,10 +313,32 @@ router.get('/', async (req, res) => {
     const objects = await listS3Objects('jobs/');
     const jobIds  = new Set();
     objects.forEach(obj => { const m = obj.Key.match(/^jobs\/([^\/]+)\//); if (m) jobIds.add(m[1]); });
+
     const jobs = [];
     for (const jobId of jobIds) {
-      try { jobs.push(await getJsonFromS3(`jobs/${jobId}/metadata.json`)); } catch {}
+      try {
+        const metadata = await getJsonFromS3(`jobs/${jobId}/metadata.json`);
+
+        // Enrich with queue.json if metadata is missing doc counts
+        if (!metadata.totalDocuments || metadata.totalDocuments === 0) {
+          try {
+            const queue = await getJsonFromS3(`jobs/${jobId}/processing/queue.json`);
+            metadata.totalDocuments = queue.totalDocuments || 0;
+            metadata.processedCount = queue.processedCount || 0;
+            metadata.failedCount    = queue.failedDocuments?.length || 0;
+            // If queue says completed but metadata doesn't, fix status
+            if (queue.status === 'completed' && metadata.status !== 'completed') {
+              metadata.status      = 'completed';
+              metadata.completedAt = queue.completedAt || metadata.completedAt;
+              metadata.reportKey   = queue.reportKey   || metadata.reportKey;
+            }
+          } catch {}
+        }
+
+        jobs.push(metadata);
+      } catch {}
     }
+
     jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json({ jobs });
   } catch (error) {
